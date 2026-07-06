@@ -34,6 +34,8 @@
 #define STATUS_MESSAGE_LEN 32
 #define STARTUP_ERROR_MESSAGE_LEN 64
 #define DISPLAY_AUTO_OFF_DELAY_MS 10000
+#define RECORDING_WAKE_DOUBLE_TAP_WINDOW_MS 700
+#define RECORDING_WAKE_MAX_TAP_MS 300
 #define RECORDING_STORAGE_CHECK_INTERVAL_MS 500
 #define CAPTURE_CHUNK_BYTES (N_SAMPLES * CHANNELS * sizeof(int16_t))
 #define RECORDING_STORAGE_RESERVE_BYTES (64 * 1024)
@@ -89,9 +91,13 @@ static char pending_status_message[STATUS_MESSAGE_LEN];
 static char startup_error_message[STARTUP_ERROR_MESSAGE_LEN] = "Storage/audio startup failed";
 static bool storage_full_status_active = false;
 static const TickType_t display_auto_off_delay_ticks = pdMS_TO_TICKS(DISPLAY_AUTO_OFF_DELAY_MS);
+static const TickType_t recording_wake_double_tap_window_ticks = pdMS_TO_TICKS(RECORDING_WAKE_DOUBLE_TAP_WINDOW_MS);
+static const TickType_t recording_wake_max_tap_ticks = pdMS_TO_TICKS(RECORDING_WAKE_MAX_TAP_MS);
 static bool display_auto_off_enabled = true;
 static bool display_auto_off_off = false;
 static TickType_t last_touch_or_ui_activity_tick;
+static TickType_t recording_wake_first_tap_tick;
+static TickType_t recording_wake_press_start_tick;
 static wav_writer_t wav_writer = {0};
 
 static void refresh_recording_controls(void);
@@ -661,6 +667,12 @@ static void display_auto_off_activity_mark(void)
     last_touch_or_ui_activity_tick = xTaskGetTickCount();
 }
 
+static void recording_wake_guard_reset(void)
+{
+    recording_wake_first_tap_tick = 0;
+    recording_wake_press_start_tick = 0;
+}
+
 static void display_auto_off_overlay_update(void)
 {
     if (wake_layer == NULL)
@@ -693,6 +705,7 @@ static void display_auto_off_wake(void)
         display_auto_off_off = false;
     }
 
+    recording_wake_guard_reset();
     display_auto_off_activity_mark();
     display_auto_off_overlay_update();
 
@@ -713,6 +726,7 @@ static void display_auto_off_force_on(void)
         }
     }
 
+    recording_wake_guard_reset();
     display_auto_off_off = false;
     display_auto_off_activity_mark();
     display_auto_off_overlay_update();
@@ -743,6 +757,7 @@ static void display_auto_off_maybe_sleep(void)
 
         ESP_LOGI(TAG, "Display backlight off after inactivity");
         display_auto_off_off = true;
+        recording_wake_guard_reset();
         display_auto_off_overlay_update();
     }
 }
@@ -1305,19 +1320,92 @@ static void play_button_event_cb(lv_event_t *event)
 static void wake_layer_event_cb(lv_event_t *event)
 {
     lv_event_code_t code = lv_event_get_code(event);
-    if (code != LV_EVENT_PRESSED && code != LV_EVENT_CLICKED)
+    if (code != LV_EVENT_PRESSED &&
+        code != LV_EVENT_RELEASED &&
+        code != LV_EVENT_PRESS_LOST &&
+        code != LV_EVENT_SHORT_CLICKED &&
+        code != LV_EVENT_DOUBLE_CLICKED)
     {
         return;
     }
 
-    if (display_auto_off_off)
+    if (!display_auto_off_off)
+    {
+        if (code == LV_EVENT_PRESSED)
+        {
+            display_auto_off_activity_mark();
+        }
+        recording_wake_guard_reset();
+        return;
+    }
+
+    app_ui_state_t state = app_state_get();
+    if (state != APP_UI_STATE_RECORDING)
+    {
+        recording_wake_guard_reset();
+        if (code == LV_EVENT_PRESSED)
+        {
+            display_auto_off_wake();
+        }
+        return;
+    }
+
+    TickType_t now = xTaskGetTickCount();
+
+    if (code == LV_EVENT_PRESS_LOST)
+    {
+        recording_wake_guard_reset();
+        return;
+    }
+
+    if (code == LV_EVENT_PRESSED)
+    {
+        recording_wake_press_start_tick = now;
+        return;
+    }
+
+    if (code == LV_EVENT_DOUBLE_CLICKED)
     {
         display_auto_off_wake();
+        return;
     }
-    else
+
+    if (code == LV_EVENT_RELEASED)
     {
-        display_auto_off_activity_mark();
+        return;
     }
+
+    if (code != LV_EVENT_SHORT_CLICKED)
+    {
+        return;
+    }
+
+    if (recording_wake_press_start_tick == 0)
+    {
+        recording_wake_guard_reset();
+        return;
+    }
+
+    if (recording_wake_press_start_tick != 0)
+    {
+        TickType_t press_duration = now - recording_wake_press_start_tick;
+        recording_wake_press_start_tick = 0;
+
+        if (press_duration > recording_wake_max_tap_ticks)
+        {
+            recording_wake_guard_reset();
+            return;
+        }
+    }
+
+    if (recording_wake_first_tap_tick != 0 &&
+        (now - recording_wake_first_tap_tick) <= recording_wake_double_tap_window_ticks)
+    {
+        display_auto_off_wake();
+        return;
+    }
+
+    recording_wake_first_tap_tick = now;
 }
 
 static void ui_activity_event_cb(lv_event_t *event)
@@ -1343,7 +1431,10 @@ static void create_wake_layer(void)
     lv_obj_add_flag(wake_layer, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(wake_layer, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_event_cb(wake_layer, wake_layer_event_cb, LV_EVENT_PRESSED, NULL);
-    lv_obj_add_event_cb(wake_layer, wake_layer_event_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(wake_layer, wake_layer_event_cb, LV_EVENT_RELEASED, NULL);
+    lv_obj_add_event_cb(wake_layer, wake_layer_event_cb, LV_EVENT_PRESS_LOST, NULL);
+    lv_obj_add_event_cb(wake_layer, wake_layer_event_cb, LV_EVENT_SHORT_CLICKED, NULL);
+    lv_obj_add_event_cb(wake_layer, wake_layer_event_cb, LV_EVENT_DOUBLE_CLICKED, NULL);
 }
 
 static void startup_error_timer_cb(lv_timer_t *timer)
