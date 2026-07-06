@@ -8,6 +8,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
 #include "esp_system.h"
 #include "esp_log.h"
 #include "esp_spiffs.h"
@@ -33,17 +34,30 @@
 #define STATUS_MESSAGE_LEN 32
 #define STARTUP_ERROR_MESSAGE_LEN 64
 #define DISPLAY_AUTO_OFF_DELAY_MS 10000
+#define RECORDING_STORAGE_CHECK_INTERVAL_MS 500
 #define CAPTURE_CHUNK_BYTES (N_SAMPLES * CHANNELS * sizeof(int16_t))
 #define RECORDING_STORAGE_RESERVE_BYTES (64 * 1024)
 #define RECORDING_MIN_START_FREE_BYTES (RECORDING_STORAGE_RESERVE_BYTES + CAPTURE_CHUNK_BYTES)
+#define APP_COMMAND_QUEUE_LEN 4
 
 typedef enum {
     APP_UI_STATE_READY,
+    APP_UI_STATE_RECORD_STARTING,
     APP_UI_STATE_RECORDING,
     APP_UI_STATE_SAVED,
+    APP_UI_STATE_PLAY_STARTING,
     APP_UI_STATE_PLAYING,
     APP_UI_STATE_ERROR,
 } app_ui_state_t;
+
+typedef enum {
+    APP_CMD_START_RECORDING,
+    APP_CMD_START_PLAYBACK,
+} app_command_type_t;
+
+typedef struct {
+    app_command_type_t type;
+} app_command_t;
 
 typedef struct {
     FILE *fp;
@@ -65,6 +79,7 @@ static lv_obj_t *play_btn;
 static lv_obj_t *status_label;
 static lv_obj_t *wake_layer;
 static SemaphoreHandle_t app_state_mutex;
+static QueueHandle_t app_command_queue;
 static app_ui_state_t app_ui_state = APP_UI_STATE_READY;
 static bool recording_available = false;
 static TickType_t recording_started_tick;
@@ -372,13 +387,21 @@ static void app_state_snapshot(app_ui_state_t *state, bool *has_recording, TickT
     app_state_unlock();
 }
 
-static void app_state_set_recording(void)
+static void app_state_set_record_starting(void)
 {
     app_state_lock();
-    app_ui_state = APP_UI_STATE_RECORDING;
+    app_ui_state = APP_UI_STATE_RECORD_STARTING;
     recording_available = false;
-    recording_started_tick = xTaskGetTickCount();
     saved_recording_seconds = 0;
+    pending_status_available = false;
+    storage_full_status_active = false;
+    app_state_unlock();
+}
+
+static void app_state_set_play_starting(void)
+{
+    app_state_lock();
+    app_ui_state = APP_UI_STATE_PLAY_STARTING;
     pending_status_available = false;
     storage_full_status_active = false;
     app_state_unlock();
@@ -393,6 +416,26 @@ static void app_state_set_error(void)
     pending_status_available = false;
     storage_full_status_active = false;
     app_state_unlock();
+}
+
+static bool app_command_send(app_command_type_t type)
+{
+    if (app_command_queue == NULL)
+    {
+        ESP_LOGE(TAG, "App command queue is not initialized");
+        return false;
+    }
+
+    app_command_t command = {
+        .type = type,
+    };
+    if (xQueueSend(app_command_queue, &command, 0) != pdPASS)
+    {
+        ESP_LOGE(TAG, "App command queue is full");
+        return false;
+    }
+
+    return true;
 }
 
 static uint32_t ticks_to_seconds(TickType_t ticks)
@@ -431,6 +474,181 @@ static esp_err_t finalize_recording_locked(uint32_t *saved_seconds, uint32_t *da
     }
 
     return ret;
+}
+
+static void app_command_start_recording(void)
+{
+    size_t free_bytes = 0;
+    esp_err_t ret = spiffs_free_bytes(&free_bytes);
+    if (ret != ESP_OK)
+    {
+        app_state_lock();
+        if (app_ui_state == APP_UI_STATE_RECORD_STARTING)
+        {
+            app_ui_state = APP_UI_STATE_ERROR;
+            recording_available = false;
+            saved_recording_seconds = 0;
+            pending_status_available = false;
+            storage_full_status_active = false;
+            app_status_post_locked("Error");
+        }
+        app_state_unlock();
+        return;
+    }
+
+    if (free_bytes < RECORDING_MIN_START_FREE_BYTES)
+    {
+        ESP_LOGW(TAG, "Not enough SPIFFS space to start recording: free=%zu, required=%zu",
+                 free_bytes, (size_t)RECORDING_MIN_START_FREE_BYTES);
+        app_state_lock();
+        if (app_ui_state == APP_UI_STATE_RECORD_STARTING)
+        {
+            app_ui_state = APP_UI_STATE_READY;
+            recording_available = false;
+            saved_recording_seconds = 0;
+            pending_status_available = false;
+            storage_full_status_active = false;
+            app_status_post_locked("Storage full");
+        }
+        app_state_unlock();
+        return;
+    }
+
+    ret = wav_writer_start();
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Recording start failed: %s", esp_err_to_name(ret));
+        app_state_lock();
+        if (app_ui_state == APP_UI_STATE_RECORD_STARTING)
+        {
+            app_ui_state = APP_UI_STATE_ERROR;
+            recording_available = false;
+            saved_recording_seconds = 0;
+            pending_status_available = false;
+            storage_full_status_active = false;
+            app_status_post_locked("Error");
+        }
+        app_state_unlock();
+        return;
+    }
+
+    ESP_LOGI(TAG, "Recording started: %s", RECORDING_PATH);
+    bool stale_command = false;
+    app_state_lock();
+    if (app_ui_state == APP_UI_STATE_RECORD_STARTING)
+    {
+        app_ui_state = APP_UI_STATE_RECORDING;
+        recording_available = false;
+        recording_started_tick = xTaskGetTickCount();
+        saved_recording_seconds = 0;
+        pending_status_available = false;
+        storage_full_status_active = false;
+        app_status_post_locked("Recording 00:00");
+    }
+    else
+    {
+        stale_command = true;
+    }
+    app_state_unlock();
+
+    if (stale_command)
+    {
+        wav_writer_close();
+    }
+}
+
+static void app_command_start_playback(void)
+{
+    bool has_recording = false;
+    app_state_snapshot(NULL, &has_recording, NULL, NULL);
+
+    if (!has_recording || !recording_file_is_valid())
+    {
+        ESP_LOGW(TAG, "Play requested with no finalized recording");
+        app_state_lock();
+        if (app_ui_state == APP_UI_STATE_PLAY_STARTING)
+        {
+            app_ui_state = APP_UI_STATE_READY;
+            recording_available = false;
+            saved_recording_seconds = 0;
+            pending_status_available = false;
+            storage_full_status_active = false;
+            app_status_post_locked("No recording");
+        }
+        app_state_unlock();
+        return;
+    }
+
+    app_state_lock();
+    if (app_ui_state == APP_UI_STATE_PLAY_STARTING)
+    {
+        app_ui_state = APP_UI_STATE_PLAYING;
+        pending_status_available = false;
+        storage_full_status_active = false;
+        app_status_post_locked("Playing");
+    }
+    else
+    {
+        app_state_unlock();
+        return;
+    }
+    app_state_unlock();
+
+    ESP_LOGI(TAG, "Playing recording: %s", RECORDING_PATH);
+    esp_err_t ret = bsp_extra_player_play_file(RECORDING_PATH);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Playback start failed: %s", esp_err_to_name(ret));
+
+        bool file_still_valid = recording_file_is_valid();
+        app_state_lock();
+        if (file_still_valid)
+        {
+            app_ui_state = APP_UI_STATE_ERROR;
+            recording_available = false;
+            saved_recording_seconds = 0;
+            pending_status_available = false;
+            storage_full_status_active = false;
+            app_status_post_locked("Error");
+        }
+        else
+        {
+            app_ui_state = APP_UI_STATE_READY;
+            recording_available = false;
+            saved_recording_seconds = 0;
+            pending_status_available = false;
+            storage_full_status_active = false;
+            app_status_post_locked("No recording");
+        }
+        app_state_unlock();
+    }
+}
+
+static void app_command_task(void *pvParameters)
+{
+    (void)pvParameters;
+
+    app_command_t command;
+    while (1)
+    {
+        if (xQueueReceive(app_command_queue, &command, portMAX_DELAY) != pdPASS)
+        {
+            continue;
+        }
+
+        switch (command.type)
+        {
+        case APP_CMD_START_RECORDING:
+            app_command_start_recording();
+            break;
+        case APP_CMD_START_PLAYBACK:
+            app_command_start_playback();
+            break;
+        default:
+            ESP_LOGW(TAG, "Unknown app command: %d", command.type);
+            break;
+        }
+    }
 }
 
 static void format_status_duration(char *buffer, size_t buffer_len, const char *prefix, uint32_t seconds)
@@ -680,6 +898,7 @@ void audio_fft_task(void *pvParameters)
     ESP_LOGI(TAG, "FFT and window initialized");
 
     TickType_t last_wake_time = xTaskGetTickCount();
+    TickType_t last_storage_check_tick = 0;
     size_t bytes_read;
 
     while (1)
@@ -701,12 +920,25 @@ void audio_fft_task(void *pvParameters)
         state = app_state_get();
         if (state == APP_UI_STATE_RECORDING)
         {
+            bool can_write = true;
+            size_t free_bytes = 0;
+            TickType_t now = xTaskGetTickCount();
+            bool check_storage = last_storage_check_tick == 0 ||
+                                 (now - last_storage_check_tick) >= pdMS_TO_TICKS(RECORDING_STORAGE_CHECK_INTERVAL_MS);
+
+            if (check_storage)
+            {
+                ret = storage_can_accept_write(bytes_read, &can_write, &free_bytes);
+                last_storage_check_tick = now;
+            }
+            else
+            {
+                ret = ESP_OK;
+            }
+
             app_state_lock();
             if (app_ui_state == APP_UI_STATE_RECORDING)
             {
-                bool can_write = false;
-                size_t free_bytes = 0;
-                ret = storage_can_accept_write(bytes_read, &can_write, &free_bytes);
                 if (ret != ESP_OK)
                 {
                     wav_writer_close();
@@ -813,6 +1045,14 @@ static void timer_cb(lv_timer_t *timer)
         char status[24];
         format_status_duration(status, sizeof(status), "Recording", ticks_to_seconds(xTaskGetTickCount() - started_tick));
         set_status_text(status);
+    }
+    else if (state == APP_UI_STATE_RECORD_STARTING)
+    {
+        set_status_text("Starting...");
+    }
+    else if (state == APP_UI_STATE_PLAY_STARTING)
+    {
+        set_status_text("Loading...");
     }
     else if (state == APP_UI_STATE_PLAYING)
     {
@@ -939,7 +1179,9 @@ static void refresh_recording_controls(void)
                           (state == APP_UI_STATE_ERROR);
     bool stop_enabled = state == APP_UI_STATE_RECORDING;
     bool play_enabled = has_recording &&
+                        state != APP_UI_STATE_RECORD_STARTING &&
                         state != APP_UI_STATE_RECORDING &&
+                        state != APP_UI_STATE_PLAY_STARTING &&
                         state != APP_UI_STATE_PLAYING;
 
     set_button_enabled(record_btn, record_enabled);
@@ -964,50 +1206,18 @@ static void record_button_event_cb(lv_event_t *event)
 
     display_auto_off_wake();
 
-    size_t free_bytes = 0;
-    esp_err_t ret = spiffs_free_bytes(&free_bytes);
-    if (ret != ESP_OK)
-    {
-        app_state_set_error();
-        display_auto_off_force_on();
-        set_status_text("Error");
-        refresh_recording_controls();
-        return;
-    }
-
-    if (free_bytes < RECORDING_MIN_START_FREE_BYTES)
-    {
-        ESP_LOGW(TAG, "Not enough SPIFFS space to start recording: free=%zu, required=%zu",
-                 free_bytes, (size_t)RECORDING_MIN_START_FREE_BYTES);
-        app_state_lock();
-        app_ui_state = APP_UI_STATE_READY;
-        recording_available = false;
-        saved_recording_seconds = 0;
-        pending_status_available = false;
-        storage_full_status_active = false;
-        app_state_unlock();
-        display_auto_off_force_on();
-        set_status_text("Storage full");
-        refresh_recording_controls();
-        return;
-    }
-
-    ret = wav_writer_start();
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Recording start failed: %s", esp_err_to_name(ret));
-        app_state_set_error();
-        display_auto_off_force_on();
-        set_status_text("Error");
-        refresh_recording_controls();
-        return;
-    }
-
-    ESP_LOGI(TAG, "Recording started: %s", RECORDING_PATH);
-    app_state_set_recording();
+    app_state_set_record_starting();
     display_auto_off_activity_mark();
-    set_status_text("Recording 00:00");
+    set_status_text("Starting...");
     refresh_recording_controls();
+
+    if (!app_command_send(APP_CMD_START_RECORDING))
+    {
+        app_state_set_error();
+        display_auto_off_force_on();
+        set_status_text("Error");
+        refresh_recording_controls();
+    }
 }
 
 static void stop_button_event_cb(lv_event_t *event)
@@ -1062,7 +1272,7 @@ static void play_button_event_cb(lv_event_t *event)
     bool has_recording = false;
     app_state_snapshot(NULL, &has_recording, NULL, NULL);
 
-    if (!has_recording || !recording_file_is_valid())
+    if (!has_recording)
     {
         ESP_LOGW(TAG, "Play requested with no finalized recording");
         app_state_lock();
@@ -1078,45 +1288,16 @@ static void play_button_event_cb(lv_event_t *event)
         return;
     }
 
-    app_state_lock();
-    app_ui_state = APP_UI_STATE_PLAYING;
-    pending_status_available = false;
-    storage_full_status_active = false;
-    app_state_unlock();
-    display_auto_off_force_on();
-    set_status_text("Playing");
+    app_state_set_play_starting();
+    display_auto_off_activity_mark();
+    set_status_text("Loading...");
     refresh_recording_controls();
 
-    ESP_LOGI(TAG, "Playing recording: %s", RECORDING_PATH);
-    esp_err_t ret = bsp_extra_player_play_file(RECORDING_PATH);
-    if (ret != ESP_OK)
+    if (!app_command_send(APP_CMD_START_PLAYBACK))
     {
-        ESP_LOGE(TAG, "Playback start failed: %s", esp_err_to_name(ret));
-
-        bool file_still_valid = recording_file_is_valid();
-        app_state_lock();
-        if (file_still_valid)
-        {
-            app_ui_state = APP_UI_STATE_ERROR;
-            recording_available = false;
-            saved_recording_seconds = 0;
-            pending_status_available = false;
-            storage_full_status_active = false;
-            app_state_unlock();
-            display_auto_off_force_on();
-            set_status_text("Error");
-        }
-        else
-        {
-            app_ui_state = APP_UI_STATE_READY;
-            recording_available = false;
-            saved_recording_seconds = 0;
-            pending_status_available = false;
-            storage_full_status_active = false;
-            app_state_unlock();
-            display_auto_off_force_on();
-            set_status_text("No recording");
-        }
+        app_state_set_error();
+        display_auto_off_force_on();
+        set_status_text("Error");
         refresh_recording_controls();
     }
 }
@@ -1262,6 +1443,27 @@ void app_main(void)
             ESP_LOGE(TAG, "Failed to create app state mutex");
             snprintf(startup_error_message, sizeof(startup_error_message),
                      "App state mutex failed\n%s", esp_err_to_name(ESP_ERR_NO_MEM));
+            ret = ESP_ERR_NO_MEM;
+        }
+    }
+    if (ret == ESP_OK)
+    {
+        app_command_queue = xQueueCreate(APP_COMMAND_QUEUE_LEN, sizeof(app_command_t));
+        if (app_command_queue == NULL)
+        {
+            ESP_LOGE(TAG, "Failed to create app command queue");
+            snprintf(startup_error_message, sizeof(startup_error_message),
+                     "App command queue failed\n%s", esp_err_to_name(ESP_ERR_NO_MEM));
+            ret = ESP_ERR_NO_MEM;
+        }
+    }
+    if (ret == ESP_OK)
+    {
+        if (xTaskCreate(app_command_task, "app_cmd", 4 * 1024, NULL, 4, NULL) != pdPASS)
+        {
+            ESP_LOGE(TAG, "Failed to create app command task");
+            snprintf(startup_error_message, sizeof(startup_error_message),
+                     "App command task failed\n%s", esp_err_to_name(ESP_ERR_NO_MEM));
             ret = ESP_ERR_NO_MEM;
         }
     }
