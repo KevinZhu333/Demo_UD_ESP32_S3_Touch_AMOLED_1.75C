@@ -80,5 +80,9 @@ Desktop.ini
 # vscode
 .vscode
 
-#codex build
+# codex build
 build-codex*
+**/build-codex*
+
+# project timeline
+project_timeline

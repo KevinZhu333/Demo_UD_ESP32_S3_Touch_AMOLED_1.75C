@@ -1,6 +1,0 @@
--mlongcalls
--fno-builtin-memcpy
--fno-builtin-memset
--fno-builtin-bzero
--mdisable-hardware-atomics
-"-specs=/Users/starspulse/myProject3/build-codex2/specs/picolibc.specs"

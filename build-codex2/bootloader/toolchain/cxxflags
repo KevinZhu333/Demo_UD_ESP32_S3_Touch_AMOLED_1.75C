@@ -1,5 +1,0 @@
-"-specs=/Users/starspulse/myProject3/build-codex2/bootloader/specs/picolibc.specs"
--mlongcalls
--fno-builtin-memcpy
--fno-builtin-memset
--fno-builtin-bzero
