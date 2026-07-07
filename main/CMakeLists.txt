@@ -1,15 +1,4 @@
-set(LV_DEMO_DIR ../managed_components/lvgl__lvgl/demos)
-file(GLOB_RECURSE LV_DEMOS_SOURCES ${LV_DEMO_DIR}/*.c)
-
 idf_component_register(
-    SRCS main.c ${LV_DEMOS_SOURCES}
-    INCLUDE_DIRS . ${LV_DEMO_DIR}
-    PRIV_REQUIRES spiffs esp_driver_sdmmc esp32_s3_touch_amoled_1_75c bsp_extra)
-
-idf_component_get_property(LVGL_LIB lvgl__lvgl COMPONENT_LIB)
-target_compile_options(
-    ${LVGL_LIB} 
-    PRIVATE
-        -DLV_LVGL_H_INCLUDE_SIMPLE
-        -DLV_USE_DEMO_MUSIC
-)
+    SRCS main.c runtime_config.c wifi_manager.c cloud_ws.c audio_streamer.c offline_buffer.c
+    INCLUDE_DIRS .
+    PRIV_REQUIRES spiffs esp_driver_sdmmc esp_wifi esp_netif esp_event esp_timer nvs_flash esp_websocket_client json esp_app_format esp32_s3_touch_amoled_1_75c bsp_extra lvgl__lvgl)

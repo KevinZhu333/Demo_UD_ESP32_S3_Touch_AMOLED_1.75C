@@ -59,6 +59,7 @@ dist/
 # Virtual environment folders
 venv/
 .venv/
+.venv-cloud/
 env/
 
 # Language Servers
@@ -86,3 +87,7 @@ build-codex*
 
 # project timeline
 project_timeline
+
+.devcontainer
+
+.pytest_cache/

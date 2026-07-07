@@ -1,0 +1,61 @@
+menu "Project Runtime Configuration"
+
+    config WIFI_MANAGER_SSID
+        string "Wi-Fi station SSID"
+        default ""
+        help
+            SSID for Wi-Fi station mode. Leave empty to initialize networking
+            but skip connection attempts.
+
+    config WIFI_MANAGER_PASSWORD
+        string "Wi-Fi station password"
+        default ""
+        help
+            Password for Wi-Fi station mode. Keep real credentials in local
+            sdkconfig/menuconfig output, not in tracked defaults.
+
+    config RUNTIME_CONFIG_CLOUD_WSS_URL
+        string "Cloud WebSocket URL"
+        default ""
+        help
+            Cloud WebSocket endpoint used by later transport tasks. Leave empty
+            to keep cloud transport disabled. Keep production URLs in local
+            sdkconfig/menuconfig output, not in tracked defaults.
+
+    config RUNTIME_CONFIG_DEVICE_ID
+        string "Device ID"
+        default "esp32s3-dev"
+        help
+            Non-secret device identity sent to the cloud transport.
+
+    config RUNTIME_CONFIG_COLLECTION_TOKEN
+        string "Collection token"
+        default ""
+        help
+            Temporary v1 collection token. Leave empty to allow networking while
+            blocking audio upload until a local config provides a real token.
+
+    config RUNTIME_CONFIG_LOCAL_WAV_MIRROR
+        bool "Enable local WAV debug mirror"
+        default y
+        help
+            Keep writing local WAV recordings as a debug/fallback mirror while
+            cloud streaming is incomplete or unavailable.
+
+    config OFFLINE_BUFFER_MAX_BYTES
+        int "Offline audio buffer max bytes"
+        default 262144
+        range 32768 2097152
+        help
+            Maximum SPIFFS bytes used for lossy buffered audio frames during
+            short Wi-Fi or WebSocket outages.
+
+    config OFFLINE_BUFFER_MIN_FREE_BYTES
+        int "Offline audio buffer reserved SPIFFS free bytes"
+        default 65536
+        range 16384 1048576
+        help
+            Minimum SPIFFS free space the offline audio buffer tries to leave
+            available for debug WAV mirroring and filesystem overhead.
+
+endmenu

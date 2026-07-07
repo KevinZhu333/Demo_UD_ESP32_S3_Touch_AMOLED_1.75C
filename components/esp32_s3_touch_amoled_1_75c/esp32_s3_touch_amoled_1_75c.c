@@ -24,6 +24,10 @@
 
 static const char *TAG = "ESP32-S3-Touch-AMOLED-1.75C";
 
+#define BSP_LCD_LVGL_BUFFER_HEIGHT 24
+#define BSP_LCD_SPI_TRANS_QUEUE_DEPTH 3
+#define BSP_LCD_SPI_MAX_TRANSFER_SZ (BSP_LCD_H_RES * BSP_LCD_LVGL_BUFFER_HEIGHT * BSP_LCD_BITS_PER_PIXEL / 8)
+
 static i2c_master_bus_handle_t i2c_handle = NULL; // I2C Handle
 static bool i2c_initialized = false;
 static lv_indev_t *disp_indev = NULL;
@@ -389,7 +393,7 @@ esp_err_t bsp_display_new(const bsp_display_config_t *config, esp_lcd_panel_hand
     ESP_ERROR_CHECK(spi_bus_initialize(BSP_LCD_SPI_NUM, &buscfg, SPI_DMA_CH_AUTO));
 
     esp_lcd_panel_io_spi_config_t io_config = CO5300_PANEL_IO_QSPI_CONFIG(BSP_LCD_CS, NULL, NULL);
-    io_config.trans_queue_depth = 10;
+    io_config.trans_queue_depth = BSP_LCD_SPI_TRANS_QUEUE_DEPTH;
     co5300_vendor_config_t vendor_config = {
         .init_cmds = lcd_init_cmds,
         .init_cmds_size = sizeof(lcd_init_cmds) / sizeof(lcd_init_cmds[0]),
@@ -454,7 +458,7 @@ static lv_display_t *bsp_display_lcd_init(const bsp_display_cfg_t *cfg)
 {
     assert(cfg != NULL);
     const bsp_display_config_t disp_config = {
-        .max_transfer_sz = BSP_LCD_H_RES * BSP_LCD_V_RES * BSP_LCD_BITS_PER_PIXEL / 8,
+        .max_transfer_sz = BSP_LCD_SPI_MAX_TRANSFER_SZ,
     };
 
     BSP_ERROR_CHECK_RETURN_NULL(bsp_display_new(&disp_config, &panel_handle, &io_handle));
@@ -468,7 +472,7 @@ static lv_display_t *bsp_display_lcd_init(const bsp_display_cfg_t *cfg)
             .rotation = cfg->rotation,
             .hor_res = BSP_LCD_H_RES,
             .ver_res = BSP_LCD_V_RES,
-            .buffer_height = 50,
+            .buffer_height = BSP_LCD_LVGL_BUFFER_HEIGHT,
             .use_psram = true,
             .enable_ppa_accel = false,
             .require_double_buffer = true,

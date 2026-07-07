@@ -73,16 +73,6 @@ dependencies:
       registry_url: https://components.espressif.com
       type: service
     version: 0.5.3
-  espressif/esp-dsp:
-    component_hash: ed9ac175b14e0414399a2b33c525579414b5bad19a2a67b12ea212def96f9a98
-    dependencies:
-    - name: idf
-      require: private
-      version: '>=4.2'
-    source:
-      registry_url: https://components.espressif.com/
-      type: service
-    version: 1.8.2
   espressif/esp_codec_dev:
     component_hash: df70f10af8d7b922add7b9d07372c9c97ab356e58d72b7a892050227c2d44348
     dependencies:
@@ -272,6 +262,16 @@ dependencies:
     - esp32c61
     - esp32h4
     version: 1.0.2
+  espressif/esp_websocket_client:
+    component_hash: 3fb288702517ef4d75bf933a115f1056ee0c2540d964f9e1d856e0bb67e1dfeb
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.7.0
   espressif/freetype:
     component_hash: a4169cdd22b3572342b2d640d7082405b8895e3214539283601c03412589b65d
     dependencies:
@@ -366,16 +366,16 @@ direct_dependencies:
 - chmorgan/esp-audio-player
 - chmorgan/esp-file-iterator
 - espressif/cjson
-- espressif/esp-dsp
 - espressif/esp_codec_dev
 - espressif/esp_lcd_co5300
 - espressif/esp_lcd_panel_io_additions
 - espressif/esp_lvgl_adapter
+- espressif/esp_websocket_client
 - espressif/usb
 - idf
 - lvgl/lvgl
 - waveshare/esp32_s3_touch_amoled_1_75c
 - waveshare/esp_lcd_touch_cst9217
-manifest_hash: c1a498f28838a078831eab9aefcc62507caf208c2cb62dfaa34f233b092af283
+manifest_hash: 6ab004e46984bbc7145c6813e279be46157a36bef3d381f94fb572a10ac2c09d
 target: esp32s3
 version: 3.0.0
