@@ -11,3 +11,5 @@ esp_err_t offline_buffer_peek_next(uint8_t **frame, size_t *len, uint32_t *seq);
 esp_err_t offline_buffer_peek_next_seq(uint32_t *seq);
 esp_err_t offline_buffer_pop_acked(uint32_t ack_seq);
 size_t offline_buffer_bytes_used(void);
+uint32_t offline_buffer_overflow_count(void);
+uint32_t offline_buffer_dropped_count(void);

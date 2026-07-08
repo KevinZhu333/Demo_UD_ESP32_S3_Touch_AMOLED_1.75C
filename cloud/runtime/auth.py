@@ -20,8 +20,8 @@ def validate_device_hello(message: Any) -> tuple[bool, str]:
         return False, "collection_token is required"
 
     caps = message.get("caps")
-    if not isinstance(caps, list) or "audio.pcm16" not in caps:
-        return False, "audio.pcm16 capability is required"
+    if not isinstance(caps, list) or not {"card_control", "status"}.issubset(set(caps)):
+        return False, "card_control and status capabilities are required"
 
     expected_token = expected_collection_token()
     if expected_token is not None and message["collection_token"] != expected_token:

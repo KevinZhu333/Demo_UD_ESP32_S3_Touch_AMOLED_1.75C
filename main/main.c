@@ -15,9 +15,8 @@
 #include "bsp/esp-bsp.h"
 #include "bsp/display.h"
 #include "bsp_board_extra.h"
-#include "audio_streamer.h"
+#include "audio_segment_recorder.h"
 #include "cloud_ws.h"
-#include "offline_buffer.h"
 #include "runtime_config.h"
 #include "wifi_manager.h"
 
@@ -371,22 +370,13 @@ static bool app_recording_debug_wav_active(void)
     return active;
 }
 
-static const char *cloud_unavailable_status(void)
-{
-    if (!runtime_config_wifi_credentials_configured() || !runtime_config_cloud_endpoint_configured())
-    {
-        return "Local only";
-    }
-    if (!runtime_config_collection_token_configured())
-    {
-        return "Auth missing";
-    }
-
-    return "Cloud unavailable";
-}
-
 static bool recording_file_is_valid(void)
 {
+    if (!runtime_config_local_wav_mirror_enabled())
+    {
+        return false;
+    }
+
     struct stat st;
 
     if (stat(RECORDING_PATH, &st) != 0)
@@ -395,6 +385,11 @@ static bool recording_file_is_valid(void)
     }
 
     return st.st_size >= WAV_HEADER_SIZE;
+}
+
+static bool recording_debug_wav_playback_allowed(void)
+{
+    return runtime_config_local_wav_mirror_enabled() && recording_file_is_valid();
 }
 
 static esp_err_t spiffs_free_bytes(size_t *free_bytes)
@@ -511,7 +506,7 @@ static void app_state_set_ready(void)
 {
     app_state_lock();
     app_ui_state = APP_UI_STATE_READY;
-    recording_available = recording_file_is_valid();
+    recording_available = recording_debug_wav_playback_allowed();
     saved_recording_seconds = 0;
     recording_cloud_active = false;
     recording_local_only = false;
@@ -565,7 +560,7 @@ static esp_err_t finalize_recording_locked(uint32_t *saved_seconds, uint32_t *da
     TickType_t elapsed_ticks = xTaskGetTickCount() - recording_started_tick;
     uint32_t elapsed_seconds = ticks_to_seconds(elapsed_ticks);
 
-    audio_streamer_stop();
+    esp_err_t segment_ret = audio_segment_recorder_stop();
 
     esp_err_t ret = ESP_OK;
     bool debug_wav_active = recording_debug_wav_active;
@@ -580,6 +575,11 @@ static esp_err_t finalize_recording_locked(uint32_t *saved_seconds, uint32_t *da
         {
             *data_bytes = 0;
         }
+    }
+
+    if (ret == ESP_OK && segment_ret != ESP_OK)
+    {
+        ret = segment_ret;
     }
 
     if (ret == ESP_OK && (!debug_wav_active || recording_file_is_valid()))
@@ -618,7 +618,7 @@ static esp_err_t finalize_recording_locked(uint32_t *saved_seconds, uint32_t *da
 
 static void abort_recording_locked(const char *status)
 {
-    audio_streamer_stop();
+    audio_segment_recorder_abort();
     wav_writer_close();
     app_ui_state = APP_UI_STATE_ERROR;
     recording_available = false;
@@ -633,12 +633,12 @@ static void abort_recording_locked(const char *status)
 static void app_command_start_recording(void)
 {
     bool debug_wav_mirror = runtime_config_local_wav_mirror_enabled();
-    esp_err_t stream_ret = audio_streamer_start();
-    bool cloud_active = stream_ret == ESP_OK;
-    bool local_only = !cloud_active && debug_wav_mirror;
-    if (stream_ret != ESP_OK)
+    esp_err_t segment_ret = audio_segment_recorder_start();
+    bool cloud_active = segment_ret == ESP_OK && audio_segment_recorder_upload_enabled();
+    bool local_only = segment_ret == ESP_OK && !cloud_active;
+    if (segment_ret != ESP_OK)
     {
-        ESP_LOGW(TAG, "Audio streamer unavailable for this recording: %s", esp_err_to_name(stream_ret));
+        ESP_LOGW(TAG, "Segment recorder unavailable for this recording: %s", esp_err_to_name(segment_ret));
         if (!debug_wav_mirror)
         {
             app_state_lock();
@@ -652,7 +652,7 @@ static void app_command_start_recording(void)
                 recording_debug_wav_active = false;
                 pending_status_available = false;
                 storage_full_status_active = false;
-                app_status_post_locked(cloud_unavailable_status());
+            app_status_post_locked("Storage error");
             }
             app_state_unlock();
             return;
@@ -665,7 +665,7 @@ static void app_command_start_recording(void)
         esp_err_t ret = spiffs_free_bytes(&free_bytes);
         if (ret != ESP_OK)
         {
-            if (cloud_active)
+            if (segment_ret == ESP_OK)
             {
                 ESP_LOGW(TAG, "Disabling local WAV mirror for this cloud recording: %s", esp_err_to_name(ret));
                 debug_wav_mirror = false;
@@ -694,9 +694,9 @@ static void app_command_start_recording(void)
         {
             ESP_LOGW(TAG, "Not enough SPIFFS space to start recording: free=%zu, required=%zu",
                      free_bytes, (size_t)RECORDING_MIN_START_FREE_BYTES);
-            if (cloud_active)
+            if (segment_ret == ESP_OK)
             {
-                ESP_LOGW(TAG, "Continuing cloud recording without local WAV mirror");
+                ESP_LOGW(TAG, "Continuing segmented recording without local WAV mirror");
                 debug_wav_mirror = false;
             }
             else
@@ -725,9 +725,9 @@ static void app_command_start_recording(void)
             if (ret != ESP_OK)
             {
                 ESP_LOGE(TAG, "Recording start failed: %s", esp_err_to_name(ret));
-                if (cloud_active)
+                if (segment_ret == ESP_OK)
                 {
-                    ESP_LOGW(TAG, "Continuing cloud recording without local WAV mirror");
+                    ESP_LOGW(TAG, "Continuing segmented recording without local WAV mirror");
                     debug_wav_mirror = false;
                 }
                 else
@@ -753,7 +753,7 @@ static void app_command_start_recording(void)
     }
 
     ESP_LOGI(TAG, "Recording started%s%s",
-             cloud_active ? " with cloud streaming" : " local-only",
+             cloud_active ? " with segmented cloud upload" : " local-only segmented",
              debug_wav_mirror ? " and local WAV mirror" : "");
     bool stale_command = false;
     app_state_lock();
@@ -768,7 +768,7 @@ static void app_command_start_recording(void)
         recording_debug_wav_active = debug_wav_mirror;
         pending_status_available = false;
         storage_full_status_active = false;
-        app_status_post_locked(cloud_active ? "Streaming" : "Local only");
+        app_status_post_locked(cloud_active ? "Recording" : "Local only");
     }
     else
     {
@@ -778,7 +778,7 @@ static void app_command_start_recording(void)
 
     if (stale_command)
     {
-        audio_streamer_stop();
+        audio_segment_recorder_abort();
         wav_writer_close();
     }
     else
@@ -792,7 +792,7 @@ static void app_command_start_playback(void)
     bool has_recording = false;
     app_state_snapshot(NULL, &has_recording, NULL, NULL);
 
-    if (!has_recording || !recording_file_is_valid())
+    if (!has_recording || !recording_debug_wav_playback_allowed())
     {
         ESP_LOGW(TAG, "Play requested with no finalized recording");
         app_state_lock();
@@ -830,7 +830,7 @@ static void app_command_start_playback(void)
     {
         ESP_LOGE(TAG, "Playback start failed: %s", esp_err_to_name(ret));
 
-        bool file_still_valid = recording_file_is_valid();
+        bool file_still_valid = recording_debug_wav_playback_allowed();
         app_state_lock();
         if (file_still_valid)
         {
@@ -1035,7 +1035,7 @@ static void audio_player_event_cb(audio_player_cb_ctx_t *ctx)
         }
         break;
     case AUDIO_PLAYER_CALLBACK_EVENT_UNKNOWN_FILE_TYPE:
-        if (recording_file_is_valid())
+        if (recording_debug_wav_playback_allowed())
         {
             app_ui_state = APP_UI_STATE_ERROR;
             recording_available = false;
@@ -1152,15 +1152,26 @@ static void audio_capture_task(void *pvParameters)
             continue;
         }
 
-        if (audio_streamer_is_active())
+        if (audio_segment_recorder_is_active())
         {
-            esp_err_t stream_ret = audio_streamer_submit_pcm(raw_data,
-                                                             bytes_read / sizeof(int16_t),
-                                                             SAMPLE_RATE,
-                                                             CHANNELS);
-            if (stream_ret != ESP_OK)
+            esp_err_t segment_ret = audio_segment_recorder_write_pcm(raw_data, bytes_read);
+            if (segment_ret != ESP_OK)
             {
-                ESP_LOGD(TAG, "PCM stream submit failed: %s", esp_err_to_name(stream_ret));
+                audio_segment_recorder_stats_t stats;
+                audio_segment_recorder_get_stats(&stats);
+                ESP_LOGE(TAG,
+                         "Segment recorder write failed: %s local_gap_count=%" PRIu32 " storage_overflow_count=%" PRIu32 " queue_overflow_count=%" PRIu32,
+                         esp_err_to_name(segment_ret),
+                         stats.local_gap_count,
+                         stats.storage_overflow_count,
+                         stats.queue_overflow_count);
+                app_state_lock();
+                if (app_ui_state == APP_UI_STATE_RECORDING)
+                {
+                    abort_recording_locked("Storage error");
+                }
+                app_state_unlock();
+                continue;
             }
         }
 
@@ -1260,7 +1271,7 @@ static void status_timer_cb(lv_timer_t *timer)
         const char *prefix = "Recording";
         if (app_recording_cloud_active())
         {
-            prefix = offline_buffer_bytes_used() > 0 ? "Buffering" : "Streaming";
+            prefix = "Recording";
         }
         else if (app_recording_local_only())
         {
@@ -1679,6 +1690,16 @@ static void deferred_network_start_task(void *pvParameters)
     if (cloud_ret != ESP_OK)
     {
         ESP_LOGW(TAG, "Cloud WebSocket startup failed, continuing local-only: %s", esp_err_to_name(cloud_ret));
+    }
+
+    if (audio_segment_recorder_upload_enabled())
+    {
+        esp_err_t pending_upload_ret = audio_segment_recorder_start_pending_uploads();
+        app_heap_diag_log("after pending segment upload start");
+        if (pending_upload_ret != ESP_OK)
+        {
+            ESP_LOGW(TAG, "Pending segment upload startup failed: %s", esp_err_to_name(pending_upload_ret));
+        }
     }
 
     deferred_network_start_task_handle = NULL;

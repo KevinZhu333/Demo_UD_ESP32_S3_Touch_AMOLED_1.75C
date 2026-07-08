@@ -9,7 +9,7 @@ def hello(token="dev-token"):
         "type": "HELLO",
         "device_id": "esp32-test",
         "device_class": "hw",
-        "caps": ["audio.pcm16"],
+        "caps": ["card_control", "status"],
         "collection_token": token,
     }
 

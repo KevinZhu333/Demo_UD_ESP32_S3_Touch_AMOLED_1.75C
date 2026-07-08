@@ -2,6 +2,7 @@
 
 #include <inttypes.h>
 #include <limits.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -22,6 +23,7 @@
 #define AUDIO_STREAMER_TASK_PRIORITY 4
 #define AUDIO_STREAMER_DRAIN_INTERVAL_MS 100
 #define AUDIO_STREAMER_BUFFERED_RETRY_MS 1000
+#define AUDIO_STREAMER_LOSS_LOG_INTERVAL 16
 
 typedef struct {
     int16_t *samples;
@@ -42,6 +44,48 @@ static QueueHandle_t audio_streamer_queue;
 static TaskHandle_t audio_streamer_task_handle;
 static bool audio_streamer_active;
 static uint32_t audio_streamer_next_seq;
+static audio_streamer_stats_t audio_streamer_stats;
+static uint32_t audio_streamer_last_observed_offline_drop_count;
+
+static void audio_streamer_note_loss(const char *reason, esp_err_t ret)
+{
+    audio_streamer_stats.audio_loss_count++;
+    audio_streamer_stats.capture_gap_count++;
+    uint32_t loss_count = audio_streamer_stats.audio_loss_count;
+    if (loss_count == 1 || (loss_count % AUDIO_STREAMER_LOSS_LOG_INTERVAL) == 0)
+    {
+        ESP_LOGE(TAG,
+                 "Audio stream debug loss: reason=%s err=%s audio_loss_count=%" PRIu32 " offline_overflow_count=%" PRIu32 " capture_gap_count=%" PRIu32,
+                 reason,
+                 esp_err_to_name(ret),
+                 audio_streamer_stats.audio_loss_count,
+                 audio_streamer_stats.offline_overflow_count,
+                 audio_streamer_stats.capture_gap_count);
+    }
+}
+
+static void audio_streamer_send_stats_control(void)
+{
+    char json[256];
+    int written = snprintf(json,
+                           sizeof(json),
+                           "{\"type\":\"AUDIO_STATS\",\"device_audio_loss_count\":%" PRIu32 ",\"offline_overflow_count\":%" PRIu32 ",\"capture_gap_count\":%" PRIu32 ",\"last_seq\":%" PRIu32 "}",
+                           audio_streamer_stats.audio_loss_count,
+                           audio_streamer_stats.offline_overflow_count,
+                           audio_streamer_stats.capture_gap_count,
+                           audio_streamer_stats.last_seq);
+    if (written <= 0 || written >= (int)sizeof(json))
+    {
+        ESP_LOGW(TAG, "Audio stats control message did not fit");
+        return;
+    }
+
+    esp_err_t send_ret = cloud_ws_send_json(json, pdMS_TO_TICKS(100));
+    if (send_ret != ESP_OK)
+    {
+        ESP_LOGW(TAG, "Failed to queue AUDIO_STATS control message: %s", esp_err_to_name(send_ret));
+    }
+}
 
 static void write_u16_le(uint8_t *dst, uint16_t value)
 {
@@ -144,6 +188,7 @@ static esp_err_t audio_streamer_build_protocol_frame(const audio_streamer_frame_
     protocol_frame->data = frame_data;
     protocol_frame->len = frame_len;
     protocol_frame->seq = seq;
+    audio_streamer_stats.last_seq = seq;
     return ESP_OK;
 }
 
@@ -152,9 +197,31 @@ static esp_err_t audio_streamer_buffer_protocol_frame(const audio_streamer_proto
     esp_err_t ret = offline_buffer_push(frame->data, frame->len, frame->seq);
     if (ret != ESP_OK)
     {
-        ESP_LOGW(TAG, "Failed to buffer audio frame %" PRIu32 ": %s", frame->seq, esp_err_to_name(ret));
+        audio_streamer_stats.offline_overflow_count = offline_buffer_overflow_count();
+        audio_streamer_note_loss("offline_buffer_push", ret);
+        ESP_LOGE(TAG, "Failed to buffer audio frame %" PRIu32 ": %s", frame->seq, esp_err_to_name(ret));
+    }
+    else
+    {
+        audio_streamer_stats.buffered_count++;
     }
     return ret;
+}
+
+static void audio_streamer_process_pcm_frame(const audio_streamer_frame_t *frame)
+{
+    audio_streamer_protocol_frame_t protocol_frame = {0};
+    esp_err_t ret = audio_streamer_build_protocol_frame(frame, &protocol_frame);
+    if (ret != ESP_OK)
+    {
+        audio_streamer_note_loss("build_protocol_frame", ret);
+        ESP_LOGE(TAG, "Audio frame build failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    audio_streamer_stats.built_count++;
+    audio_streamer_buffer_protocol_frame(&protocol_frame);
+    audio_streamer_free_protocol_frame(&protocol_frame);
 }
 
 static void audio_streamer_drain_offline_buffer(bool *buffered_frame_inflight,
@@ -212,6 +279,12 @@ static void audio_streamer_drain_offline_buffer(bool *buffered_frame_inflight,
     if (ret != ESP_OK)
     {
         ESP_LOGW(TAG, "Failed to read buffered audio frame: %s", esp_err_to_name(ret));
+        uint32_t dropped_count = offline_buffer_dropped_count();
+        if (dropped_count != audio_streamer_last_observed_offline_drop_count)
+        {
+            audio_streamer_last_observed_offline_drop_count = dropped_count;
+            audio_streamer_note_loss("offline_buffer_dropped_frame", ret);
+        }
         return;
     }
 
@@ -246,6 +319,21 @@ static void audio_streamer_flush_queue(void)
     }
 }
 
+static void audio_streamer_drain_queue_to_buffer(void)
+{
+    if (audio_streamer_queue == NULL)
+    {
+        return;
+    }
+
+    audio_streamer_frame_t frame;
+    while (xQueueReceive(audio_streamer_queue, &frame, 0) == pdPASS)
+    {
+        audio_streamer_process_pcm_frame(&frame);
+        audio_streamer_free_frame(&frame);
+    }
+}
+
 static void audio_streamer_task(void *pvParameters)
 {
     (void)pvParameters;
@@ -265,21 +353,7 @@ static void audio_streamer_task(void *pvParameters)
             continue;
         }
 
-        if (audio_streamer_active)
-        {
-            audio_streamer_protocol_frame_t protocol_frame = {0};
-            esp_err_t ret = audio_streamer_build_protocol_frame(&frame, &protocol_frame);
-            if (ret != ESP_OK)
-            {
-                ESP_LOGD(TAG, "Audio frame build failed: %s", esp_err_to_name(ret));
-            }
-            else
-            {
-                audio_streamer_buffer_protocol_frame(&protocol_frame);
-                audio_streamer_free_protocol_frame(&protocol_frame);
-            }
-        }
-
+        audio_streamer_process_pcm_frame(&frame);
         audio_streamer_free_frame(&frame);
     }
 }
@@ -322,8 +396,10 @@ esp_err_t audio_streamer_start(void)
     }
 
     audio_streamer_flush_queue();
+    memset(&audio_streamer_stats, 0, sizeof(audio_streamer_stats));
+    audio_streamer_last_observed_offline_drop_count = offline_buffer_dropped_count();
     audio_streamer_active = true;
-    ESP_LOGI(TAG, "Audio streamer started");
+    ESP_LOGI(TAG, "Audio streamer started; debug counters reset");
     return ESP_OK;
 }
 
@@ -335,13 +411,35 @@ void audio_streamer_stop(void)
     }
 
     audio_streamer_active = false;
-    audio_streamer_flush_queue();
-    ESP_LOGI(TAG, "Audio streamer stopped");
+    audio_streamer_drain_queue_to_buffer();
+    audio_streamer_stats.offline_overflow_count = offline_buffer_overflow_count();
+    ESP_LOGI(TAG,
+             "Audio streamer stopped: submitted=%" PRIu32 " queued=%" PRIu32 " built=%" PRIu32 " buffered=%" PRIu32 " last_seq=%" PRIu32 " audio_loss_count=%" PRIu32 " offline_overflow_count=%" PRIu32 " capture_gap_count=%" PRIu32,
+             audio_streamer_stats.submitted_count,
+             audio_streamer_stats.queued_count,
+             audio_streamer_stats.built_count,
+             audio_streamer_stats.buffered_count,
+             audio_streamer_stats.last_seq,
+             audio_streamer_stats.audio_loss_count,
+             audio_streamer_stats.offline_overflow_count,
+             audio_streamer_stats.capture_gap_count);
+    audio_streamer_send_stats_control();
 }
 
 bool audio_streamer_is_active(void)
 {
     return audio_streamer_active;
+}
+
+void audio_streamer_get_stats(audio_streamer_stats_t *stats)
+{
+    if (stats == NULL)
+    {
+        return;
+    }
+
+    *stats = audio_streamer_stats;
+    stats->offline_overflow_count = offline_buffer_overflow_count();
 }
 
 esp_err_t audio_streamer_submit_pcm(const int16_t *samples,
@@ -369,12 +467,15 @@ esp_err_t audio_streamer_submit_pcm(const int16_t *samples,
     size_t byte_len = sample_count * sizeof(int16_t);
     if (byte_len > AUDIO_STREAMER_MAX_PCM_BYTES || byte_len > INT_MAX)
     {
+        audio_streamer_note_loss("submit_invalid_size", ESP_ERR_INVALID_SIZE);
         return ESP_ERR_INVALID_SIZE;
     }
 
+    audio_streamer_stats.submitted_count++;
     int16_t *copy = malloc(byte_len);
     if (copy == NULL)
     {
+        audio_streamer_note_loss("submit_no_mem", ESP_ERR_NO_MEM);
         return ESP_ERR_NO_MEM;
     }
     memcpy(copy, samples, byte_len);
@@ -389,8 +490,10 @@ esp_err_t audio_streamer_submit_pcm(const int16_t *samples,
     if (xQueueSend(audio_streamer_queue, &frame, 0) != pdPASS)
     {
         free(copy);
+        audio_streamer_note_loss("submit_queue_full", ESP_ERR_TIMEOUT);
         return ESP_ERR_TIMEOUT;
     }
 
+    audio_streamer_stats.queued_count++;
     return ESP_OK;
 }

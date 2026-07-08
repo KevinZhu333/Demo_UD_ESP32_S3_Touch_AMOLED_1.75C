@@ -18,9 +18,16 @@ menu "Project Runtime Configuration"
         string "Cloud WebSocket URL"
         default ""
         help
-            Cloud WebSocket endpoint used by later transport tasks. Leave empty
-            to keep cloud transport disabled. Keep production URLs in local
-            sdkconfig/menuconfig output, not in tracked defaults.
+            Optional cloud WebSocket control/status endpoint. Audio proof upload
+            uses RUNTIME_CONFIG_CLOUD_AUDIO_SEGMENT_URL instead.
+
+    config RUNTIME_CONFIG_CLOUD_AUDIO_SEGMENT_URL
+        string "Cloud audio segment upload URL"
+        default ""
+        help
+            HTTP endpoint that receives closed WAV segments, for example
+            http://host:8000/v1/device/audio-segments. Leave empty to record
+            local segments without cloud upload.
 
     config RUNTIME_CONFIG_DEVICE_ID
         string "Device ID"
@@ -37,18 +44,29 @@ menu "Project Runtime Configuration"
 
     config RUNTIME_CONFIG_LOCAL_WAV_MIRROR
         bool "Enable local WAV debug mirror"
-        default y
+        default n
         help
-            Keep writing local WAV recordings as a debug/fallback mirror while
-            cloud streaming is incomplete or unavailable.
+            Optional device-local debug/fallback mirror at /spiffs/recording.wav.
+            Segmented proof runs use flat /spiffs/segment_*.wav files as the
+            durable upload queue; cloud ACKed segment artifacts are the proof
+            authority.
+
+    config AUDIO_SEGMENT_SECONDS
+        int "Audio segment duration seconds"
+        default 60
+        range 10 300
+        help
+            Duration of each closed WAV segment before it is queued for upload.
+            At 16 kHz stereo PCM16, 60 seconds is about 3.84 MB before headers.
 
     config OFFLINE_BUFFER_MAX_BYTES
         int "Offline audio buffer max bytes"
         default 262144
         range 32768 2097152
         help
-            Maximum SPIFFS bytes used for lossy buffered audio frames during
-            short Wi-Fi or WebSocket outages.
+            Maximum SPIFFS bytes used for legacy/debug ordered WebSocket audio
+            frames during short Wi-Fi or WebSocket outages. Track B proof audio
+            uses closed WAV segment files instead.
 
     config OFFLINE_BUFFER_MIN_FREE_BYTES
         int "Offline audio buffer reserved SPIFFS free bytes"

@@ -3,6 +3,7 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -10,6 +11,7 @@
 #include "esp_app_desc.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_transport_ws.h"
 #include "esp_websocket_client.h"
 #include "freertos/event_groups.h"
@@ -51,10 +53,12 @@ static TaskHandle_t cloud_task_handle;
 static esp_websocket_client_handle_t ws_client;
 static bool cloud_started;
 static bool cloud_client_started;
-// Audio ACK progress spans reconnects so the offline buffer can discard confirmed frames.
+// Debug audio ACK progress spans reconnects so the legacy offline buffer can discard confirmed frames.
 static bool cloud_have_audio_ack;
 static bool cloud_logged_session_audio_ack;
 static uint32_t cloud_highest_audio_ack_seq;
+static char cloud_run_id[96];
+static bool cloud_run_id_initialized;
 
 static bool cloud_ws_socket_connected(void)
 {
@@ -150,12 +154,31 @@ static esp_err_t cloud_ws_enqueue_copy(cloud_ws_message_type_t type, const void 
     return cloud_ws_enqueue_owned(type, copy, len, timeout_ticks);
 }
 
+static const char *cloud_ws_get_run_id(void)
+{
+    if (!cloud_run_id_initialized)
+    {
+        int written = snprintf(cloud_run_id,
+                               sizeof(cloud_run_id),
+                               "%s-%" PRId64,
+                               runtime_config_device_id(),
+                               (int64_t)esp_timer_get_time());
+        if (written <= 0 || written >= (int)sizeof(cloud_run_id))
+        {
+            snprintf(cloud_run_id, sizeof(cloud_run_id), "device-run");
+        }
+        cloud_run_id_initialized = true;
+    }
+    return cloud_run_id;
+}
+
 static esp_err_t cloud_ws_queue_hello(void)
 {
     esp_err_t ret = ESP_OK;
     cJSON *root = cJSON_CreateObject();
     cJSON *caps = cJSON_CreateArray();
-    cJSON *cap = NULL;
+    cJSON *control_cap = NULL;
+    cJSON *status_cap = NULL;
     if (root == NULL || caps == NULL)
     {
         ret = ESP_ERR_NO_MEM;
@@ -163,23 +186,33 @@ static esp_err_t cloud_ws_queue_hello(void)
     }
 
     const esp_app_desc_t *app_desc = esp_app_get_description();
-    cap = cJSON_CreateString("audio.pcm16");
+    control_cap = cJSON_CreateString("card_control");
+    status_cap = cJSON_CreateString("status");
     if (cJSON_AddStringToObject(root, "type", "HELLO") == NULL ||
         cJSON_AddStringToObject(root, "device_id", runtime_config_device_id()) == NULL ||
+        cJSON_AddStringToObject(root, "run_id", cloud_ws_get_run_id()) == NULL ||
         cJSON_AddStringToObject(root, "device_class", "hw") == NULL ||
         cJSON_AddStringToObject(root, "fw_ver", app_desc != NULL ? app_desc->version : "unknown") == NULL ||
-        cap == NULL)
+        control_cap == NULL ||
+        status_cap == NULL)
     {
         ret = ESP_ERR_NO_MEM;
         goto cleanup;
     }
 
-    if (!cJSON_AddItemToArray(caps, cap))
+    if (!cJSON_AddItemToArray(caps, control_cap))
     {
         ret = ESP_ERR_NO_MEM;
         goto cleanup;
     }
-    cap = NULL;
+    control_cap = NULL;
+
+    if (!cJSON_AddItemToArray(caps, status_cap))
+    {
+        ret = ESP_ERR_NO_MEM;
+        goto cleanup;
+    }
+    status_cap = NULL;
 
     if (!cJSON_AddItemToObject(root, "caps", caps))
     {
@@ -215,7 +248,8 @@ static esp_err_t cloud_ws_queue_hello(void)
 cleanup:
     cJSON_Delete(root);
     cJSON_Delete(caps);
-    cJSON_Delete(cap);
+    cJSON_Delete(control_cap);
+    cJSON_Delete(status_cap);
     return ret;
 }
 
@@ -266,7 +300,7 @@ static void cloud_ws_handle_text_message(const esp_websocket_event_data_t *data)
             if (!cloud_logged_session_audio_ack)
             {
                 cloud_logged_session_audio_ack = true;
-                ESP_LOGI(TAG, "AUDIO_ACK received seq=%" PRIu32, seq);
+                ESP_LOGI(TAG, "Debug AUDIO_ACK received seq=%" PRIu32, seq);
             }
             ESP_LOGD(TAG, "Highest audio ACK advanced to %" PRIu32, seq);
         }
@@ -471,7 +505,7 @@ esp_err_t cloud_ws_start(void)
         return ESP_OK;
     }
 
-    if (!runtime_config_cloud_endpoint_configured())
+    if (runtime_config_cloud_wss_url() == NULL || runtime_config_cloud_wss_url()[0] == '\0')
     {
         ESP_LOGW(TAG, "Cloud WSS URL is empty; WebSocket transport is disabled");
         return ESP_OK;

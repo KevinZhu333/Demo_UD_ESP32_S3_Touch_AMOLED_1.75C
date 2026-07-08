@@ -30,6 +30,7 @@ static size_t offline_entry_count;
 static size_t offline_bytes_used;
 static bool offline_initialized;
 static uint32_t offline_dropped_count;
+static uint32_t offline_overflow_count;
 
 static bool seq_acked(uint32_t seq, uint32_t ack_seq)
 {
@@ -82,17 +83,20 @@ static esp_err_t offline_buffer_ensure_capacity(size_t incoming_len)
 {
     if (incoming_len > CONFIG_OFFLINE_BUFFER_MAX_BYTES)
     {
+        offline_overflow_count++;
         return ESP_ERR_INVALID_SIZE;
     }
 
-    while (offline_entry_count >= OFFLINE_BUFFER_MAX_FRAMES ||
-           offline_bytes_used + incoming_len > CONFIG_OFFLINE_BUFFER_MAX_BYTES)
+    if (offline_entry_count >= OFFLINE_BUFFER_MAX_FRAMES ||
+        offline_bytes_used + incoming_len > CONFIG_OFFLINE_BUFFER_MAX_BYTES)
     {
-        esp_err_t ret = offline_buffer_drop_oldest();
-        if (ret != ESP_OK)
-        {
-            return ret;
-        }
+        offline_overflow_count++;
+        ESP_LOGE(TAG, "Offline buffer capacity exhausted; refusing frame len=%zu used=%zu entries=%zu overflow_total=%" PRIu32,
+                 incoming_len,
+                 offline_bytes_used,
+                 offline_entry_count,
+                 offline_overflow_count);
+        return ESP_ERR_NO_MEM;
     }
 
     size_t total = 0;
@@ -103,21 +107,19 @@ static esp_err_t offline_buffer_ensure_capacity(size_t incoming_len)
         return ret;
     }
 
-    while (used + incoming_len + CONFIG_OFFLINE_BUFFER_MIN_FREE_BYTES > total && offline_entry_count > 0)
+    if (used + incoming_len + CONFIG_OFFLINE_BUFFER_MIN_FREE_BYTES > total)
     {
-        ret = offline_buffer_drop_oldest();
-        if (ret != ESP_OK)
-        {
-            return ret;
-        }
-        ret = esp_spiffs_info(CONFIG_BSP_SPIFFS_PARTITION_LABEL, &total, &used);
-        if (ret != ESP_OK)
-        {
-            return ret;
-        }
+        offline_overflow_count++;
+        ESP_LOGE(TAG, "SPIFFS space exhausted for offline audio buffer; refusing frame len=%zu used=%zu total=%zu min_free=%d overflow_total=%" PRIu32,
+                 incoming_len,
+                 used,
+                 total,
+                 CONFIG_OFFLINE_BUFFER_MIN_FREE_BYTES,
+                 offline_overflow_count);
+        return ESP_ERR_NO_MEM;
     }
 
-    return used + incoming_len + CONFIG_OFFLINE_BUFFER_MIN_FREE_BYTES <= total ? ESP_OK : ESP_ERR_NO_MEM;
+    return ESP_OK;
 }
 
 esp_err_t offline_buffer_init(void)
@@ -153,6 +155,7 @@ esp_err_t offline_buffer_init(void)
     offline_entry_count = 0;
     offline_bytes_used = 0;
     offline_dropped_count = 0;
+    offline_overflow_count = 0;
     offline_initialized = true;
     ESP_LOGI(TAG, "Offline audio buffer initialized: max_bytes=%d min_free=%d max_frames=%d",
              CONFIG_OFFLINE_BUFFER_MAX_BYTES,
@@ -299,4 +302,14 @@ esp_err_t offline_buffer_pop_acked(uint32_t ack_seq)
 size_t offline_buffer_bytes_used(void)
 {
     return offline_bytes_used;
+}
+
+uint32_t offline_buffer_overflow_count(void)
+{
+    return offline_overflow_count;
+}
+
+uint32_t offline_buffer_dropped_count(void)
+{
+    return offline_dropped_count;
 }
