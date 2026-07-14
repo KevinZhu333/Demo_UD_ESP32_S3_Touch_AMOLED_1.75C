@@ -1,13 +1,3 @@
-## Whiteboard status
-
-- Phase: Scope locked; implementation planning
-- Implementation status: Not started
-- Scope status: Locked
-- Rule: A condition is binding when its Decision is Yes and its ID is included in the Agreed decisions range.
-- Agreed decisions: A1–K11
-- Open decisions: None.
-- Final acceptance receiver: `http://192.168.15.195:8000/v1/device/audio-segments` on the same LAN.
-
 # ESP32 Device-to-Cloud Audio Demo
 
 ## Demo definition
@@ -103,7 +93,6 @@ The broader ideas in [the product mockup](</Users/starspulse/Downloads/demo-kick
 - To-do extraction
 - Notion/task integration
 - Idle detection
-- Double-tap product interaction
 - Bluetooth earphones
 - Wi‑Fi provisioning screens
 - OTA updates
@@ -123,6 +112,8 @@ The 65-second run is the quick smoke test:
 6. Confirm six complete 10-second WAV files and one final partial WAV arrive at the receiver.
 7. Play them in order and confirm they contain the continuous session.
 8. Confirm the device reports zero pending uploads.
+
+Final acceptance receiver: `http://192.168.15.195:8000/v1/device/audio-segments` on the same LAN.
 
 The final acceptance run lasts at least two continuous minutes and applies the
 same checks. That is the entire proof. No additional architecture should be
@@ -264,6 +255,11 @@ At the current format, the device creates approximately **640 KB every 10 second
 
 ### K. Acceptance conditions
 
+The K-series contains only measurable demo checks. Multi-hour and all-day
+endurance testing is not required before accepting this proof. Once K1-K9 pass
+with the required evidence, implementation stops; those are scope and workflow
+rules rather than additional acceptance conditions.
+
 | ID | Condition | Decision |
 | --- | --- | :---: |
 | K1 | The primary proof records for at least two continuous minutes. | Yes |
@@ -274,9 +270,7 @@ At the current format, the device creates approximately **640 KB every 10 second
 | K6 | On normal Wi-Fi, pending uploads normally do not exceed two segments and return to zero. | Yes |
 | K7 | On normal Wi-Fi, the final partial segment is acknowledged within 15 seconds after Stop. | Yes |
 | K8 | A secondary test disconnects Wi‑Fi for 15 seconds, confirms recording continues, then confirms queued uploads clear after reconnection. | Yes |
-| K9 | Multi-hour and all-day endurance testing is not required before calling the proof successful. | Yes |
-| K10 | Once these conditions pass, we stop adding features and declare the device-to-cloud proof complete. | Yes |
-| K11 | Let the screen sleep during recording, wake it with a double-tap, and confirm it still shows Recording with the correct upload counts. | Yes |
+| K9 | Let the screen sleep during recording, wake it with a double-tap, and confirm it still shows Recording with the correct upload counts. | Yes |
 
 ---
 
@@ -299,4 +293,4 @@ At the current format, the device creates approximately **640 KB every 10 second
 3. A scope change is written here and agreed before code changes.
 4. We prefer simplifying or deleting an unused path over introducing another abstraction.
 5. A step is complete only after its relevant test or physical-device check passes.
-6. Once K1–K11 pass, implementation stops.
+6. Once K1–K9 pass, implementation stops.
