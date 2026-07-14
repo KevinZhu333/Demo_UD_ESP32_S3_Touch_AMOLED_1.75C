@@ -14,13 +14,6 @@ menu "Project Runtime Configuration"
             Password for Wi-Fi station mode. Keep real credentials in local
             sdkconfig/menuconfig output, not in tracked defaults.
 
-    config RUNTIME_CONFIG_CLOUD_WSS_URL
-        string "Cloud WebSocket URL"
-        default ""
-        help
-            Optional cloud WebSocket control/status endpoint. Audio proof upload
-            uses RUNTIME_CONFIG_CLOUD_AUDIO_SEGMENT_URL instead.
-
     config RUNTIME_CONFIG_CLOUD_AUDIO_SEGMENT_URL
         string "Cloud audio segment upload URL"
         default ""
@@ -42,38 +35,12 @@ menu "Project Runtime Configuration"
             Temporary v1 collection token. Leave empty to allow networking while
             blocking audio upload until a local config provides a real token.
 
-    config RUNTIME_CONFIG_LOCAL_WAV_MIRROR
-        bool "Enable local WAV debug mirror"
-        default n
-        help
-            Optional device-local debug/fallback mirror at /spiffs/recording.wav.
-            Segmented proof runs use flat /spiffs/segment_*.wav files as the
-            durable upload queue; cloud ACKed segment artifacts are the proof
-            authority.
-
     config AUDIO_SEGMENT_SECONDS
         int "Audio segment duration seconds"
-        default 60
+        default 10
         range 10 300
         help
             Duration of each closed WAV segment before it is queued for upload.
-            At 16 kHz stereo PCM16, 60 seconds is about 3.84 MB before headers.
-
-    config OFFLINE_BUFFER_MAX_BYTES
-        int "Offline audio buffer max bytes"
-        default 262144
-        range 32768 2097152
-        help
-            Maximum SPIFFS bytes used for legacy/debug ordered WebSocket audio
-            frames during short Wi-Fi or WebSocket outages. Track B proof audio
-            uses closed WAV segment files instead.
-
-    config OFFLINE_BUFFER_MIN_FREE_BYTES
-        int "Offline audio buffer reserved SPIFFS free bytes"
-        default 65536
-        range 16384 1048576
-        help
-            Minimum SPIFFS free space the offline audio buffer tries to leave
-            available for debug WAV mirroring and filesystem overhead.
+            At 16 kHz stereo PCM16, 10 seconds is about 640 KB before headers.
 
 endmenu

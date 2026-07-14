@@ -19,11 +19,6 @@ const char *runtime_config_wifi_password(void)
     return CONFIG_WIFI_MANAGER_PASSWORD;
 }
 
-const char *runtime_config_cloud_wss_url(void)
-{
-    return CONFIG_RUNTIME_CONFIG_CLOUD_WSS_URL;
-}
-
 const char *runtime_config_cloud_audio_segment_url(void)
 {
     return CONFIG_RUNTIME_CONFIG_CLOUD_AUDIO_SEGMENT_URL;
@@ -37,15 +32,6 @@ const char *runtime_config_device_id(void)
 const char *runtime_config_collection_token(void)
 {
     return CONFIG_RUNTIME_CONFIG_COLLECTION_TOKEN;
-}
-
-bool runtime_config_local_wav_mirror_enabled(void)
-{
-#ifdef CONFIG_RUNTIME_CONFIG_LOCAL_WAV_MIRROR
-    return CONFIG_RUNTIME_CONFIG_LOCAL_WAV_MIRROR;
-#else
-    return false;
-#endif
 }
 
 bool runtime_config_wifi_credentials_configured(void)
@@ -95,10 +81,5 @@ void runtime_config_log_startup_warnings(void)
     if (!config_value_present(runtime_config_device_id()))
     {
         ESP_LOGW(TAG, "Device ID is empty; cloud identity is incomplete");
-    }
-
-    if (runtime_config_local_wav_mirror_enabled())
-    {
-        ESP_LOGW(TAG, "Local WAV debug mirror is enabled; segmented upload artifacts remain proof authority");
     }
 }

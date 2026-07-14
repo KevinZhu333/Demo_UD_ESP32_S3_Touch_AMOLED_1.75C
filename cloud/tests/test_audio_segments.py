@@ -16,7 +16,7 @@ pytest.importorskip("httpx")
 
 from fastapi.testclient import TestClient
 
-from cloud.api.device_ws import app
+from cloud.api.audio_receiver import app
 
 
 def _wav_bytes(*, frames: int = 16000, sample_rate: int = 16000, channels: int = 2) -> bytes:

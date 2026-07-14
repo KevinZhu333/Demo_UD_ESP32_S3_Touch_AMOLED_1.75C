@@ -15,8 +15,7 @@ endforeach()
 idf_component_register(
     SRCS ${SRCS}
     INCLUDE_DIRS ${INCLUDE_DIRS}
-    REQUIRES driver esp_driver_i2s
-    PRIV_REQUIRES esp_timer fatfs esp_psram esp_mm esp_driver_ledc
+    REQUIRES driver esp_driver_sdmmc
 )
 
 target_compile_options(

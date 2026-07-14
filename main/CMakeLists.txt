@@ -1,4 +1,4 @@
 idf_component_register(
-    SRCS main.c runtime_config.c wifi_manager.c cloud_ws.c audio_streamer.c offline_buffer.c audio_segment_recorder.c
+    SRCS main.c runtime_config.c wifi_manager.c audio_segment_recorder.c
     INCLUDE_DIRS .
-    PRIV_REQUIRES spiffs esp_driver_sdmmc esp_wifi esp_netif esp_event esp_timer nvs_flash esp_websocket_client esp_http_client mbedtls json esp_app_format esp32_s3_touch_amoled_1_75c bsp_extra lvgl__lvgl)
+    PRIV_REQUIRES spiffs esp_driver_sdmmc esp_wifi esp_netif esp_event esp_timer nvs_flash esp_http_client mbedtls json esp_app_format esp32_s3_touch_amoled_1_75c bsp_extra lvgl__lvgl)

@@ -16,6 +16,9 @@
 # Log files
 *.log
 
+# Local demo receiver output
+device-audio-segments/
+
 # Build artifacts and directories
 **/build/
 build/
