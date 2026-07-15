@@ -87,6 +87,7 @@ static char active_storage_path[SEGMENT_PATH_LEN];
 static char upload_storage_path[SEGMENT_PATH_LEN];
 static bool recorder_active;
 static bool upload_task_started;
+static int64_t session_start_time_us = -1;
 static audio_segment_recorder_stats_t recorder_stats;
 
 static void put_le16(uint8_t *dest, uint16_t value)
@@ -287,6 +288,19 @@ static uint64_t segment_start_ms_for_index(uint32_t segment_index)
         return 0;
     }
     return (uint64_t)(segment_index - 1) * (uint64_t)CONFIG_AUDIO_SEGMENT_SECONDS * 1000ULL;
+}
+
+static uint32_t pending_segment_count_locked(void)
+{
+    return recorder_stats.segments_finalized > recorder_stats.segments_uploaded
+               ? recorder_stats.segments_finalized - recorder_stats.segments_uploaded
+               : 0;
+}
+
+static uint64_t recorder_monotonic_ms(void)
+{
+    int64_t time_us = esp_timer_get_time();
+    return time_us >= 0 ? (uint64_t)time_us / 1000ULL : 0;
 }
 
 static void segment_wav_path(char *dest, size_t dest_len, uint32_t segment_index)
@@ -846,6 +860,11 @@ static esp_err_t open_active_segment_locked(uint32_t segment_index)
 
     snprintf(active_storage_path, sizeof(active_storage_path), "%s", active_segment.path);
 
+    if (segment_index == 1)
+    {
+        session_start_time_us = esp_timer_get_time();
+    }
+
     recorder_stats.segments_started++;
     recorder_stats.last_segment_index = segment_index;
     ESP_LOGI(TAG, "Started audio segment run_id=%s segment_index=%" PRIu32 " path=%s",
@@ -935,7 +954,6 @@ static esp_err_t finalize_active_segment(bool enqueue)
         return ret;
     }
 
-    recorder_stats.segments_finalized++;
     if (!enqueue || data_bytes == 0)
     {
         storage_lock();
@@ -959,12 +977,6 @@ static esp_err_t finalize_active_segment(bool enqueue)
     upload.storage_overflow_count = recorder_stats.storage_overflow_count;
     upload.upload_retry_count = recorder_stats.upload_retry_count;
 
-    ESP_LOGI(TAG,
-             "Finalized audio segment run_id=%s segment_index=%" PRIu32 " duration_ms=%" PRIu32 " data_bytes=%" PRIu32,
-             upload.run_id,
-             upload.segment_index,
-             upload.duration_ms,
-             upload.data_bytes);
     ret = write_segment_metadata_once(&upload);
     if (ret != ESP_OK)
     {
@@ -978,10 +990,23 @@ static esp_err_t finalize_active_segment(bool enqueue)
                  upload.segment_index);
         return ret;
     }
+
+    recorder_stats.segments_finalized++;
     storage_lock();
     ret = enqueue_finalized_segment(&upload);
     active_storage_path[0] = '\0';
+    uint64_t finalized_event_monotonic_ms = recorder_monotonic_ms();
     storage_unlock();
+    ESP_LOGI(TAG,
+             "segment_event=finalized event_monotonic_ms=%" PRIu64 " run_id=%s segment_index=%" PRIu32 " finalized_count=%" PRIu32 " acked_count=%" PRIu32 " pending_count=%" PRIu32 " duration_ms=%" PRIu32 " data_bytes=%" PRIu32,
+             finalized_event_monotonic_ms,
+             upload.run_id,
+             upload.segment_index,
+             recorder_stats.segments_finalized,
+             recorder_stats.segments_uploaded,
+             pending_segment_count_locked(),
+             upload.duration_ms,
+             upload.data_bytes);
     return ret;
 }
 
@@ -1374,7 +1399,13 @@ static esp_err_t cleanup_acked_segment(const upload_segment_t *segment)
     }
 
     upload_storage_path[0] = '\0';
+    uint64_t cleanup_event_monotonic_ms = recorder_monotonic_ms();
     storage_unlock();
+    ESP_LOGI(TAG,
+             "segment_event=segment_cleanup_complete event_monotonic_ms=%" PRIu64 " run_id=%s segment_index=%" PRIu32,
+             cleanup_event_monotonic_ms,
+             segment->run_id,
+             segment->segment_index);
     return ESP_OK;
 }
 
@@ -1459,14 +1490,40 @@ static void upload_segment_until_acked(upload_segment_t *segment)
         esp_err_t ret = upload_segment_file(segment);
         if (ret == ESP_OK)
         {
+            bool same_run = false;
+            uint32_t finalized_count = 0;
+            uint32_t acked_count = 0;
+            uint32_t pending_count = 0;
+            uint64_t ack_event_monotonic_ms = 0;
             segment_lock();
-            recorder_stats.segments_uploaded++;
+            if (strcmp(recorder_stats.run_id, segment->run_id) == 0)
+            {
+                recorder_stats.segments_uploaded++;
+                same_run = true;
+                finalized_count = recorder_stats.segments_finalized;
+                acked_count = recorder_stats.segments_uploaded;
+                pending_count = pending_segment_count_locked();
+                ack_event_monotonic_ms = recorder_monotonic_ms();
+            }
             segment_unlock();
-            ESP_LOGI(TAG,
-                     "Segment upload ACKed; deleting local segment run_id=%s segment_index=%" PRIu32 " path=%s",
-                     segment->run_id,
-                     segment->segment_index,
-                     segment->path);
+            if (same_run)
+            {
+                ESP_LOGI(TAG,
+                         "segment_event=acked event_monotonic_ms=%" PRIu64 " run_id=%s segment_index=%" PRIu32 " finalized_count=%" PRIu32 " acked_count=%" PRIu32 " pending_count=%" PRIu32 " cleanup_complete=false",
+                         ack_event_monotonic_ms,
+                         segment->run_id,
+                         segment->segment_index,
+                         finalized_count,
+                         acked_count,
+                         pending_count);
+            }
+            else
+            {
+                ESP_LOGI(TAG,
+                         "Recovery segment ACKed run_id=%s segment_index=%" PRIu32,
+                         segment->run_id,
+                         segment->segment_index);
+            }
             while (cleanup_acked_segment(segment) != ESP_OK)
             {
                 ESP_LOGW(TAG,
@@ -1507,15 +1564,16 @@ static void upload_task(void *pvParameters)
 {
     (void)pvParameters;
 
-    upload_segment_t segment;
+    upload_segment_t queue_hint;
     while (1)
     {
-        if (xQueueReceive(upload_queue, &segment, pdMS_TO_TICKS(1000)) != pdPASS)
+        /* Queue entries are wake hints only; durable lowest-index selection is authoritative. */
+        (void)xQueueReceive(upload_queue, &queue_hint, pdMS_TO_TICKS(1000));
+
+        upload_segment_t segment = {0};
+        if (find_next_pending_segment(&segment) != ESP_OK)
         {
-            if (find_next_pending_segment(&segment) != ESP_OK)
-            {
-                continue;
-            }
+            continue;
         }
 
         upload_segment_until_acked(&segment);
@@ -1649,6 +1707,7 @@ esp_err_t audio_segment_recorder_start(void)
         if (ret == ESP_OK)
         {
             memset(&recorder_stats, 0, sizeof(recorder_stats));
+            session_start_time_us = -1;
             make_run_id(recorder_stats.run_id, sizeof(recorder_stats.run_id));
             ret = open_active_segment_locked(1);
             recorder_active = ret == ESP_OK;
@@ -1717,11 +1776,25 @@ esp_err_t audio_segment_recorder_write_pcm(const void *data, size_t len)
 esp_err_t audio_segment_recorder_stop(void)
 {
     segment_lock();
+    int64_t stop_time_us = esp_timer_get_time();
     if (!recorder_active)
     {
         segment_unlock();
         return ESP_OK;
     }
+
+    if (session_start_time_us >= 0 && stop_time_us >= session_start_time_us)
+    {
+        recorder_stats.session_duration_ms =
+            (uint64_t)(stop_time_us - session_start_time_us) / 1000ULL;
+    }
+    uint64_t stop_monotonic_ms =
+        stop_time_us >= 0 ? (uint64_t)stop_time_us / 1000ULL : 0;
+    ESP_LOGI(TAG,
+             "session_event=stop_boundary event_monotonic_ms=%" PRIu64 " run_id=%s session_duration_ms=%" PRIu64,
+             stop_monotonic_ms,
+             recorder_stats.run_id,
+             recorder_stats.session_duration_ms);
 
     esp_err_t ret = ESP_OK;
     if (active_segment.fp != NULL)
@@ -1729,13 +1802,16 @@ esp_err_t audio_segment_recorder_stop(void)
         ret = finalize_active_segment(true);
     }
     recorder_active = false;
+    session_start_time_us = -1;
 
     audio_segment_recorder_stats_t stats = recorder_stats;
     segment_unlock();
 
     ESP_LOGI(TAG,
-             "Segmented recording stopped run_id=%s started=%" PRIu32 " finalized=%" PRIu32 " enqueued=%" PRIu32 " uploaded=%" PRIu32 " retries=%" PRIu32 " local_gap_count=%" PRIu32 " storage_overflow_count=%" PRIu32,
+             "session_event=stopped stop_monotonic_ms=%" PRIu64 " run_id=%s session_duration_ms=%" PRIu64 " started=%" PRIu32 " finalized=%" PRIu32 " enqueued=%" PRIu32 " uploaded=%" PRIu32 " retries=%" PRIu32 " local_gap_count=%" PRIu32 " storage_overflow_count=%" PRIu32,
+             stop_monotonic_ms,
              stats.run_id,
+             stats.session_duration_ms,
              stats.segments_started,
              stats.segments_finalized,
              stats.segments_enqueued,
@@ -1759,6 +1835,8 @@ void audio_segment_recorder_abort(void)
     active_storage_path[0] = '\0';
     storage_unlock();
     recorder_active = false;
+    session_start_time_us = -1;
+    recorder_stats.session_duration_ms = 0;
     recorder_stats.local_gap_count++;
     segment_unlock();
 }

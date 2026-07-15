@@ -34,6 +34,7 @@
 #define APP_DEFERRED_NETWORK_START_DELAY_MS 750
 #define APP_DEFERRED_NETWORK_START_STACK_SIZE 4096
 #define APP_DEFERRED_NETWORK_START_PRIORITY 3
+#define AUDIO_CAPTURE_TASK_PRIORITY 7
 #define APP_HEAP_DIAGNOSTICS_ENABLED 1
 
 typedef enum {
@@ -480,7 +481,7 @@ static esp_err_t startup_storage_audio_init(void)
         .base_path = CONFIG_BSP_SPIFFS_MOUNT_POINT,
         .partition_label = CONFIG_BSP_SPIFFS_PARTITION_LABEL,
         .max_files = CONFIG_BSP_SPIFFS_MAX_FILES,
-        .format_if_mount_failed = true,
+        .format_if_mount_failed = false,
     };
 
     esp_err_t ret = esp_vfs_spiffs_register(&spiffs_conf);
@@ -1009,7 +1010,12 @@ void app_main(void)
 
     if (ret == ESP_OK)
     {
-        if (xTaskCreate(audio_capture_task, "audio_capture", 6 * 1024, NULL, 5, NULL) != pdPASS)
+        if (xTaskCreate(audio_capture_task,
+                        "audio_capture",
+                        6 * 1024,
+                        NULL,
+                        AUDIO_CAPTURE_TASK_PRIORITY,
+                        NULL) != pdPASS)
         {
             ESP_LOGE(TAG, "Failed to create audio capture task");
             snprintf(startup_error_message, sizeof(startup_error_message),

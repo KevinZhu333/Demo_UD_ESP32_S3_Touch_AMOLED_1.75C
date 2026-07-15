@@ -17,6 +17,7 @@ pytest.importorskip("httpx")
 from fastapi.testclient import TestClient
 
 from cloud.api.audio_receiver import app
+from cloud.runtime.audio_segments import AudioSegmentError, run_directory_name
 
 
 def _wav_bytes(*, frames: int = 16000, sample_rate: int = 16000, channels: int = 2) -> bytes:
@@ -89,6 +90,102 @@ def test_matching_collection_token_accepts_segment_and_creates_artifact(tmp_path
     assert run_summary["upload_retry_count"] == 0
     assert run_summary["proof_failure_reasons"] == []
     assert run_summary["proof_pass"] is True
+
+
+@pytest.mark.parametrize(
+    ("run_id", "expected"),
+    [
+        ("proof-run", "proof-run"),
+        ("a/b", "~612f62"),
+        ("a?b", "~613f62"),
+        (".", "~2e"),
+        ("..", "~2e2e"),
+        ("Proof-run", "~50726f6f662d72756e"),
+    ],
+)
+def test_run_directory_name_is_exact_and_path_safe(run_id, expected):
+    mapped = run_directory_name(run_id)
+
+    assert mapped == expected
+    assert "/" not in mapped
+    assert "\\" not in mapped
+    assert mapped not in {".", ".."}
+
+
+@pytest.mark.parametrize(
+    ("first_id", "first_dir", "second_id", "second_dir"),
+    [
+        ("a/b", "~612f62", "a?b", "~613f62"),
+        ("proof-run", "proof-run", "Proof-run", "~50726f6f662d72756e"),
+    ],
+    ids=["punctuation-aliases", "case-distinct"],
+)
+def test_distinct_run_ids_use_distinct_directories(
+    tmp_path, first_id, first_dir, second_id, second_dir
+):
+    client = TestClient(app)
+    first_body = _wav_bytes(frames=8000)
+    second_body = _wav_bytes(frames=16000)
+
+    first = client.post(
+        "/v1/device/audio-segments",
+        content=first_body,
+        headers=_headers(first_body, run_id=first_id),
+    )
+    second = client.post(
+        "/v1/device/audio-segments",
+        content=second_body,
+        headers=_headers(second_body, run_id=second_id),
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["run_id"] == first_id
+    assert second.json()["run_id"] == second_id
+    first_summary_path = tmp_path / first_dir / "segment_000001.summary.json"
+    second_summary_path = tmp_path / second_dir / "segment_000001.summary.json"
+    first_summary = json.loads(first_summary_path.read_text(encoding="utf-8"))
+    second_summary = json.loads(second_summary_path.read_text(encoding="utf-8"))
+    assert first_summary["run_id"] == first_id
+    assert second_summary["run_id"] == second_id
+
+
+@pytest.mark.parametrize(("run_id", "directory"), [(".", "~2e"), ("..", "~2e2e")])
+def test_dot_run_ids_remain_inside_receiver_root(tmp_path, run_id, directory):
+    client = TestClient(app)
+    body = _wav_bytes()
+
+    response = client.post(
+        "/v1/device/audio-segments",
+        content=body,
+        headers=_headers(body, run_id=run_id),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["run_id"] == run_id
+    summary_path = tmp_path / directory / "segment_000001.summary.json"
+    assert json.loads(summary_path.read_text(encoding="utf-8"))["run_id"] == run_id
+
+
+@pytest.mark.parametrize("run_id", ["", "a" * 96], ids=["empty", "overlong"])
+def test_invalid_run_id_is_rejected_without_artifacts(tmp_path, run_id):
+    client = TestClient(app)
+    body = _wav_bytes()
+
+    response = client.post(
+        "/v1/device/audio-segments",
+        content=body,
+        headers=_headers(body, run_id=run_id),
+    )
+
+    assert response.status_code == 400
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("run_id", ["", "a" * 96], ids=["empty", "overlong"])
+def test_run_directory_name_rejects_invalid_length(run_id):
+    with pytest.raises(AudioSegmentError, match="1 to 95 UTF-8 bytes"):
+        run_directory_name(run_id)
 
 
 def test_duplicate_same_checksum_is_idempotent():

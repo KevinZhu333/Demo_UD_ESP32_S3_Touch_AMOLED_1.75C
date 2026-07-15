@@ -32,6 +32,20 @@ Build the firmware with ESP-IDF:
 idf.py build
 ```
 
+### Storage provisioning
+
+A new or deliberately erased board needs an empty SPIFFS filesystem before the
+firmware can start. Provision it explicitly with:
+
+```bash
+idf.py storage-flash
+```
+
+`storage-flash` is a destructive, operator-only first-provision or reset
+command. Run it only when no pending audio must survive. It replaces the entire
+storage partition with an empty filesystem. Ordinary `idf.py flash` does not
+include the storage partition and therefore preserves pending audio.
+
 ## Demo receiver
 
 Install the small Python receiver and run it from the repository root:

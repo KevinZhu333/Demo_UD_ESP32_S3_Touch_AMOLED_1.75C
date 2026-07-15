@@ -11,7 +11,8 @@ from time import time
 import wave
 
 
-RUN_ID_RE = re.compile(r"[^A-Za-z0-9_.:-]+")
+CANONICAL_RUN_ID_RE = re.compile(r"[a-z0-9][a-z0-9_.-]{0,94}")
+MAX_RUN_ID_UTF8_BYTES = 95
 
 
 class AudioSegmentError(ValueError):
@@ -37,13 +38,21 @@ def segment_output_dir() -> Path:
     return Path(os.getenv("CLOUD_AUDIO_SEGMENT_DIR", "device-audio-segments"))
 
 
-def sanitize_run_id(run_id: str) -> str:
-    cleaned = RUN_ID_RE.sub("_", run_id.strip())
-    return cleaned or "unknown-run"
+def run_directory_name(run_id: str) -> str:
+    try:
+        encoded = run_id.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise AudioSegmentError("run ID must be valid UTF-8") from exc
+
+    if not encoded or len(encoded) > MAX_RUN_ID_UTF8_BYTES:
+        raise AudioSegmentError("run ID must contain 1 to 95 UTF-8 bytes")
+    if CANONICAL_RUN_ID_RE.fullmatch(run_id):
+        return run_id
+    return f"~{encoded.hex()}"
 
 
 def _run_dir(run_id: str) -> Path:
-    return segment_output_dir() / sanitize_run_id(run_id)
+    return segment_output_dir() / run_directory_name(run_id)
 
 
 def _state_path(run_dir: Path) -> Path:

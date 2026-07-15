@@ -46,26 +46,36 @@ compliant.
   scaling.
 - Add DSP only under B8, compression only under C2-C5, and memory or power
   optimization only under J5. Do not bypass their required evidence.
-- Stop implementation only after every A-J requirement is satisfied with its
-  applicable evidence and K1-K9 pass with the required physical-board
-  evidence. Until then, add only work that closes an agreed contract gap.
+- Do not declare the demo complete until every `A1`-`J5` requirement is
+  satisfied with its applicable evidence and `K1`-`K9` pass with the required
+  physical-board evidence; then stop implementation. Before then, close one
+  concrete agreed gap at a time rather than treating the completion gate as one
+  demo-wide step.
 
 ## 3. Implementation discipline
 
-1. Work on one concrete implementation step at a time.
-2. Before editing, identify the `A1`-`K9` requirement IDs the step serves.
-3. Make the smallest direct change that satisfies those IDs; do not create a
-   competing architecture.
+1. Work on one concrete implementation step at a time, not the entire
+   remaining demo.
+2. Before editing, determine whether the step can affect runtime, a build/flash
+   artifact, verification evidence, or product behavior. If it can, identify
+   the `A1`-`K9` requirement IDs it serves. A typo, governance, or tooling-only
+   change may be called nonbehavioral only when it has none of those effects.
+   A storage-partition flash or erase is behavioral and must trace to F1, F3,
+   and F5.
+3. Make the smallest direct change that satisfies the applicable IDs; do not
+   create a competing architecture.
 4. Inspect the working tree and preserve all unrelated user changes. Never
    discard, overwrite, reformat, or include them without explicit direction.
-5. Keep recording higher priority than display, Wi-Fi, and upload work.
-6. Treat every closed, unacknowledged segment as durable: never silently
+5. Keep the application capture task above application-controlled display,
+   network-orchestration, and upload tasks. This ordering does not govern
+   ESP-IDF's internal Wi-Fi or system tasks.
+6. Treat every finalized, unacknowledged segment as durable: never silently
    overwrite, discard, or delete it, and never upload an active WAV file.
 7. Update `design.md` when behavior, interfaces, implementation status, or
    known gaps change. Update `spec.md` only after the decision process above.
-8. Report the IDs addressed, files changed, checks run, and remaining gaps.
-   Distinguish compiled or statically tested behavior from physical-board
-   evidence.
+8. Report the IDs addressed, or label a step nonbehavioral under item 2. Also
+   report files changed, checks run, and remaining gaps. Distinguish compiled
+   or statically tested behavior from physical-board evidence.
 
 ## 4. Secrets and credentials
 
@@ -96,16 +106,25 @@ A passing build or receiver test is evidence only for that software gate. It is
 not evidence that audio is continuous, Wi-Fi concurrency works on the board,
 the display behaves correctly, or the demo is complete.
 
-## 6. Completion criteria
+## 6. Handoff and completion criteria
 
-A step is complete only when:
+An implementation step is ready for handoff when:
 
-- its behavior matches the cited requirement IDs;
-- all applicable gates pass, or any unrun gate is explicitly reported;
+- when the step has behavioral effects, those effects match the cited
+  requirement IDs;
+- every applicable gate that was run passes, and every unrun applicable gate is
+  explicitly reported;
 - documentation describes the actual state without presenting partial or
-  unverified behavior as implemented;
+  unverified behavior as verified or complete;
 - no unrelated user work or secret material is included; and
 - remaining limitations and physical verification needs are named clearly.
+
+Software-complete work with an unrun applicable gate may be handed off as
+`Implemented / Unverified` when every gate that was run passed and every unrun
+gate is named; partial work remains labeled `Partial / Unverified` as
+applicable. Reporting an unrun gate does not permit a `Complete` or `Verified`
+claim. A step is verified complete only after every applicable software and
+physical gate passes.
 
 The demo itself is complete only after every `A1`-`J5` requirement is satisfied
 with its applicable evidence and physical evidence satisfies every `K1`-`K9`

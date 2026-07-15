@@ -17,6 +17,7 @@ typedef struct {
     uint32_t storage_overflow_count;
     uint32_t queue_overflow_count;
     uint32_t last_segment_index;
+    uint64_t session_duration_ms;
     char run_id[96];
 } audio_segment_recorder_stats_t;
 
