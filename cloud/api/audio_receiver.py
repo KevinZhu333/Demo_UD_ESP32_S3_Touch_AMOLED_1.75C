@@ -21,7 +21,9 @@ def _validate_segment_token(token: str | None) -> None:
     if not token:
         raise HTTPException(status_code=401, detail="collection token is required")
     expected_token = expected_collection_token()
-    if expected_token is not None and token != expected_token:
+    if expected_token is None:
+        raise HTTPException(status_code=503, detail="collection token is not configured")
+    if token != expected_token:
         raise HTTPException(status_code=403, detail="collection token rejected")
 
 

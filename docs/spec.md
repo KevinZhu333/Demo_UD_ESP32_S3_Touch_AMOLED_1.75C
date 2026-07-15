@@ -248,7 +248,9 @@ The normative rows in Section 6 and the measurable checks in Section 10 are froz
 
 ## 10. Measurable acceptance criteria
 
-Every row below must pass before the proof is declared complete.
+Every row below must pass, but K1-K9 are not sufficient by themselves. The
+proof is complete only when every normative A-J requirement in Section 6 is
+also satisfied with its applicable evidence.
 
 | ID | Acceptance criterion |
 | --- | --- |
@@ -262,10 +264,12 @@ Every row below must pass before the proof is declared complete.
 | K8 | A secondary test disconnects Wi-Fi for 15 seconds, confirms recording continues, and then confirms the queued uploads clear after reconnection. |
 | K9 | During recording, let the screen sleep, wake it with a double-tap, and confirm that it still shows Recording with correct upload counts. |
 
-The acceptance set intentionally contains only measurable demo checks.
-Multi-hour and all-day endurance testing is not required before accepting this
-proof. Once K1-K9 pass with the required evidence, feature work stops and the
-device-to-cloud proof is declared complete.
+The acceptance set intentionally contains only measurable end-to-end demo
+checks and does not replace the normative requirements in Section 6. Multi-hour
+and all-day endurance testing is not required before accepting this proof. Once
+every normative A-J requirement is satisfied and K1-K9 pass with the required
+physical-board evidence, feature work stops and the device-to-cloud proof is
+declared complete.
 
 ## 11. Fixed constraints and parameters
 

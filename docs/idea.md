@@ -86,7 +86,7 @@ The Play button and local playback are not part of this proof.
 
 ## Explicitly not now
 
-The broader ideas in [the product mockup](</Users/starspulse/Downloads/demo-kickoff.en(1) (2).html>) remain product context, not this implementation:
+The broader product-mockup ideas listed below remain product context, not this implementation:
 
 - Voiceprint detection
 - Speech-to-text
@@ -255,10 +255,11 @@ At the current format, the device creates approximately **640 KB every 10 second
 
 ### K. Acceptance conditions
 
-The K-series contains only measurable demo checks. Multi-hour and all-day
-endurance testing is not required before accepting this proof. Once K1-K9 pass
-with the required evidence, implementation stops; those are scope and workflow
-rules rather than additional acceptance conditions.
+The K-series contains measurable end-to-end demo checks; it does not replace
+the binding A-J conditions. Multi-hour and all-day endurance testing is not
+required before accepting this proof. The proof is complete and implementation
+stops only after every A-J condition is satisfied with its applicable evidence
+and K1-K9 pass with the required physical-board evidence.
 
 | ID | Condition | Decision |
 | --- | --- | :---: |
@@ -293,4 +294,4 @@ rules rather than additional acceptance conditions.
 3. A scope change is written here and agreed before code changes.
 4. We prefer simplifying or deleting an unused path over introducing another abstraction.
 5. A step is complete only after its relevant test or physical-device check passes.
-6. Once K1–K9 pass, implementation stops.
+6. Implementation stops only after every A-J condition is satisfied and K1-K9 pass with the required evidence.

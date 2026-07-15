@@ -65,7 +65,7 @@ def segment_env(monkeypatch, tmp_path):
     monkeypatch.setenv("CLOUD_COLLECTION_TOKEN", "dev-token")
 
 
-def test_valid_segment_upload_creates_artifact_and_run_summary(tmp_path):
+def test_matching_collection_token_accepts_segment_and_creates_artifact(tmp_path):
     client = TestClient(app)
     body = _wav_bytes(frames=16000)
 
@@ -161,7 +161,58 @@ def test_nonzero_device_counter_fails_run_summary(tmp_path):
     assert "device local gap counter is nonzero" in run_summary["proof_failure_reasons"]
 
 
-def test_bad_checksum_bad_wav_and_missing_token_are_rejected():
+def test_missing_collection_token_is_rejected_without_storing_artifacts(tmp_path):
+    client = TestClient(app)
+    body = _wav_bytes()
+    headers = _headers(body)
+    headers.pop("X-Collection-Token")
+
+    response = client.post("/v1/device/audio-segments", content=body, headers=headers)
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "collection token is required"
+    assert not (tmp_path / "proof-run").exists()
+
+
+def test_mismatched_collection_token_is_rejected_without_storing_artifacts(tmp_path):
+    client = TestClient(app)
+    body = _wav_bytes()
+    headers = _headers(body)
+    headers["X-Collection-Token"] = "different-dev-token"
+
+    response = client.post("/v1/device/audio-segments", content=body, headers=headers)
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "collection token rejected"
+    assert not (tmp_path / "proof-run").exists()
+
+
+@pytest.mark.parametrize(
+    "configured_token",
+    [None, "", " \t "],
+    ids=["unset", "empty", "whitespace"],
+)
+def test_unconfigured_collection_token_fails_closed_without_storing_artifacts(
+    monkeypatch,
+    tmp_path,
+    configured_token,
+):
+    if configured_token is None:
+        monkeypatch.delenv("CLOUD_COLLECTION_TOKEN", raising=False)
+    else:
+        monkeypatch.setenv("CLOUD_COLLECTION_TOKEN", configured_token)
+
+    client = TestClient(app)
+    body = _wav_bytes()
+
+    response = client.post("/v1/device/audio-segments", content=body, headers=_headers(body))
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "collection token is not configured"
+    assert not (tmp_path / "proof-run").exists()
+
+
+def test_bad_checksum_bad_wav_and_invalid_index_are_rejected():
     client = TestClient(app)
     body = _wav_bytes()
     headers = _headers(body)
@@ -172,9 +223,5 @@ def test_bad_checksum_bad_wav_and_missing_token_are_rejected():
 
     bad_wav = b"not a wav"
     assert client.post("/v1/device/audio-segments", content=bad_wav, headers=_headers(bad_wav, segment_index=1)).status_code == 400
-
-    missing_token_headers = dict(headers)
-    missing_token_headers.pop("X-Collection-Token")
-    assert client.post("/v1/device/audio-segments", content=body, headers=missing_token_headers).status_code == 401
 
     assert client.post("/v1/device/audio-segments", content=body, headers=_headers(body, segment_index=0)).status_code == 422

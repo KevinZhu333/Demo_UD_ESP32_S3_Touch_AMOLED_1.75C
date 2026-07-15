@@ -46,7 +46,9 @@ compliant.
   scaling.
 - Add DSP only under B8, compression only under C2-C5, and memory or power
   optimization only under J5. Do not bypass their required evidence.
-- Stop adding features when acceptance conditions K1-K9 pass.
+- Stop implementation only after every A-J requirement is satisfied with its
+  applicable evidence and K1-K9 pass with the required physical-board
+  evidence. Until then, add only work that closes an agreed contract gap.
 
 ## 3. Implementation discipline
 
@@ -88,7 +90,7 @@ Run the checks that match the changed area:
 | Cloud receiver | In an environment with receiver dependencies installed, run `python -m pytest -q cloud/tests`. |
 | Firmware | In an activated ESP-IDF environment, run `idf.py build`. |
 | Cross-cutting behavior | Run every applicable software gate above, then perform the relevant physical-board checks. |
-| Demo-complete claim | Record physical-board evidence for every acceptance condition `K1`-`K9`. |
+| Demo-complete claim | Verify evidence-backed satisfaction of every `A1`-`J5` requirement in `design.md` and record physical-board evidence for every acceptance condition `K1`-`K9`. |
 
 A passing build or receiver test is evidence only for that software gate. It is
 not evidence that audio is continuous, Wi-Fi concurrency works on the board,
@@ -105,9 +107,9 @@ A step is complete only when:
 - no unrelated user work or secret material is included; and
 - remaining limitations and physical verification needs are named clearly.
 
-The demo itself is complete only after physical evidence satisfies every
-`K1`-`K9` condition. At that point, stop implementation rather than expanding
-the proof.
+The demo itself is complete only after every `A1`-`J5` requirement is satisfied
+with its applicable evidence and physical evidence satisfies every `K1`-`K9`
+condition. At that point, stop implementation rather than expanding the proof.
 
 ## 7. Review priorities
 

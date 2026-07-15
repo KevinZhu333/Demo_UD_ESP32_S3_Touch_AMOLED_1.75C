@@ -52,7 +52,7 @@ flowchart LR
     API --> VAL["Token, checksum, WAV, metadata validation"]
     VAL --> STORE["Run directory on local filesystem"]
     STORE -->|"matching SEGMENT_ACK"| Q
-    Q -->|"delete WAV + metadata"| CLOSED
+    Q -->|"after ACK: delete WAV, then metadata"| CLOSED
 ```
 
 While the uploader handles segment *N*, the capture task writes segment
@@ -150,11 +150,25 @@ The current local artifacts are:
 ```text
 <SPIFFS mount>/segment_000001.wav
 <SPIFFS mount>/segment_000001.meta.json
+<SPIFFS mount>/segment_000001.meta.json.tmp  # only during an interrupted metadata commit
 ```
 
-The metadata records run ID, index, nominal start time, byte count, duration,
-gap/overflow counters, and retry count. Segment filenames themselves are
-index-only and the index resets for each Start.
+After closing and syncing the WAV, the recorder writes new metadata to the
+temporary path, flushes and syncs it, parses it back, validates it against the
+finalized WAV, and promotes it only when the canonical sidecar does not exist.
+Canonical metadata is a write-once snapshot: retry counters advance only in
+RAM and the HTTP headers, so retries never truncate, delete, or replace the
+sidecar. The metadata records run ID, index, nominal start time, byte count,
+duration, gap/overflow counters, and its initial retry count.
+
+A short-held storage mutex protects active-path and upload-path reservations.
+The recorder mutex is acquired before the storage mutex when both are needed;
+the storage mutex is not held during PCM writes, WAV/metadata syncing and
+validation, hashing, Wi-Fi waits, or HTTP. Start rejects with
+`ESP_ERR_INVALID_STATE` while any segment WAV, canonical or temporary sidecar,
+or upload reservation remains. Segment filenames are index-only and the index
+resets for each accepted Start, but this gate prevents reuse while an earlier
+session still owns the namespace.
 
 The lifecycle is **implemented in source**, including final-partial-segment
 closure, but boundary continuity, audio quality, exact duration, and concurrent
@@ -188,12 +202,21 @@ missing.
 The uploader is one priority-3 task with an eight-entry in-memory queue. It
 waits up to 15 seconds for Wi-Fi, uses a 30-second HTTP timeout, and waits 5
 seconds after a failed attempt. Queue overflow does not delete the durable
-file; when the queue is idle, the worker scans metadata and selects the lowest
-segment index. The same scan begins pending uploads after reboot when complete
-upload configuration is available.
+file. When the queue is idle, the worker scans the union of WAV, canonical
+metadata, and temporary-metadata names and selects the lowest index.
 
-This retry/persistence path is **implemented**. Throughput, ordering during a
-real disconnect, and absence of capture gaps are **unverified**.
+Queued and scanned candidates use the same eligibility path. Before hashing or
+transport, that path reserves the WAV name, rejects an active-path conflict,
+requires parseable canonical metadata, and verifies a finalized PCM header,
+block-aligned data length, and exact `44 + data_bytes` file size. A valid
+temporary sidecar is promoted only when canonical metadata is absent and the
+WAV passes the same validation. Invalid or ambiguous combinations are retained
+and reported rather than deleted, and they continue to block a new Start.
+
+The closed-file and retry paths are **implemented in source**. Physical proof
+that no active WAV is posted, real-disconnect ordering and throughput, reboot
+recovery, and absence of capture gaps remain **unverified**. F3 remains partial
+for the independent SPIFFS risks in Section 8.
 
 ## 6. HTTP request and acknowledgment contract
 
@@ -249,14 +272,18 @@ object containing at least:
 ```
 
 The device treats the response as an acknowledgment only when all four fields
-match the upload. It then removes both the local WAV and its metadata. A
-non-2xx response, missing body, malformed JSON, or mismatch is a retryable
-failure and leaves the originals intact.
+match the upload. It deletes the WAV first and then its sidecars. If local
+cleanup fails, the upload reservation remains and cleanup retries without
+another POST; another Start stays blocked until cleanup finishes. A non-2xx
+response, missing body, malformed JSON, or mismatch is a retryable failure and
+leaves the original WAV and canonical metadata intact.
 
-The receiver returns 401 for a missing token, 403 for a configured-token
+The receiver returns 401 for a missing request token, 503 when its own
+`CLOUD_COLLECTION_TOKEN` is absent or blank, 403 for a configured-token
 mismatch, 400 for invalid checksum/WAV/metadata consistency, 409 when the same
 run/index already exists with different audio, and validation errors for
-invalid headers. A retry with the same run, index, and checksum is idempotent.
+invalid headers. Rejections occur before artifact creation. A retry with the
+same run, index, and checksum is idempotent.
 
 ## 7. Minimal FastAPI receiver
 
@@ -292,27 +319,23 @@ demo.
 | Event | Required behavior | Current status |
 | --- | --- | --- |
 | Brief Wi-Fi loss | Keep recording; retain and later drain closed segments. | Retry path implemented; physical K8 test unverified. |
-| HTTP or ACK failure | Preserve WAV/metadata and retry sequentially. | Implemented with a 5-second retry delay. |
+| HTTP or ACK failure | Preserve WAV/metadata and retry sequentially. | Implemented with a 5-second retry delay; canonical metadata is not rewritten. Physical failure testing is unverified. |
 | Upload queue full | Preserve closed data for filesystem scan. | Implemented; queue-overflow counter is logged. |
-| Reboot with closed segments | Resume from persisted metadata after Wi-Fi returns. | **Partial.** Metadata scanning exists, but physical reboot is unverified and the current mount may format SPIFFS after a mount failure. |
+| Reboot with closed segments | Resume from persisted metadata after Wi-Fi returns. | **Partial.** Canonical recovery and valid temporary-sidecar promotion exist, but physical reboot is unverified; mount-time formatting and SPIFFS-wide power-loss corruption can still erase pending data. |
 | Power loss with active segment | Recovery is not required for this demo. | Active WAV has no finalized metadata and is not uploaded automatically. |
 | Storage reserve exhausted | Stop capture and show a visible error; never reduce quality or delete audio. | **Partial.** The 64 KB reserve and visible `Storage error` exist, but the current abort path removes the unfinished active WAV; physical behavior is unverified. |
 | Stop with pending files | End microphone capture immediately; continue uploads; show pending until Complete. | Capture stop/upload continuation implemented; UI progression missing. |
 
-### Session-safety gap
+### Session and storage safety
 
-Local filenames use only the segment index and reset to 1 for every run. The
-recorder refuses to open an existing WAV, preventing a direct silent overwrite,
-but the UI currently permits a new Start before older uploads reach zero.
-Concurrent deletion and index reuse therefore leave cross-run collision/path
-reuse risk and can stop the new run. The required demo-sized fix is to keep
-Start disabled until the previous run is Complete; adding a database or a new
-persistence service is unnecessary.
-
-This remains the possible pending-file overwrite/path-reuse gap identified for
-the demo: the direct WAV guard helps, but WAV and sidecar paths are not scoped
-by run ID, so session safety depends on timing and defensive checks rather than
-on isolated names. It is not accepted as evidence for F5 or G9.
+Local filenames use only the segment index and reset to 1 for every run. The UI
+still presents Start before it can display the required Complete state, but the
+recorder now rejects that command while any recognized WAV, canonical or
+temporary metadata, or upload/cleanup reservation remains. Once ACK cleanup
+has removed every artifact, a later Start may reuse index 1. This provides the
+required second-session namespace gate in source without another persistence
+service. Its physical behavior, including rejection during transport and local
+cleanup followed by a successful later Start, remains unverified for G9.
 
 The current run ID combines the configured device ID with boot-relative timer
 time. It distinguishes normal Starts within one boot, but it does not guarantee
@@ -320,12 +343,13 @@ uniqueness across reboots. H2 therefore remains partial until the demo uses a
 reboot-safe unique value.
 
 An unfinished active WAV after sudden power loss is intentionally outside
-recovery scope and may require manual demo reset. Closed, metadata-backed files
-are retained by the normal acknowledgment path, but session-level namespace
-safety is still partial as described above. In addition, startup currently
-mounts SPIFFS with `format_if_mount_failed = true`; a mount failure could erase
-pending files, so that behavior must be removed or otherwise resolved before
-F3 and F5 can be claimed complete.
+recovery scope and may require manual demo reset. A canonical sidecar with no
+WAV, a WAV with no recoverable sidecar, canonical and temporary sidecars
+together, or malformed metadata is ambiguous. The worker preserves and reports
+such combinations rather than guessing, and Start remains blocked for manual
+recovery. Startup also mounts SPIFFS with `format_if_mount_failed = true`, so a
+mount failure can erase pending files; SPIFFS-wide corruption after power loss
+is not otherwise mitigated. These independent risks keep F3 and F5 partial.
 
 ## 9. Task priorities and concurrency
 
@@ -338,10 +362,14 @@ F3 and F5 can be claimed complete.
 | Wi-Fi reconnect delay | `wifi_retry` | 3 | Schedules bounded reconnect attempts. |
 
 The tasks are not core-pinned. A recorder mutex protects active-file state and
-statistics; the upload worker reads only closed files. Network I/O never runs
-inside the I2S capture loop. Capture priority is higher than uploader priority,
-but filesystem rotation still occurs in the capture task, so scheduling alone
-does not prove gap-free audio.
+statistics. A storage mutex protects only namespace checks and active/upload
+path reservations; the fixed order when both are required is recorder mutex,
+then storage mutex. The uploader reserves and revalidates a candidate before
+it reads the WAV, so an active path cannot become upload-eligible during
+hashing or transport. The storage mutex is not held during PCM writes,
+filesystem syncing/validation, hashing, Wi-Fi waits, or HTTP. Capture priority
+is higher than uploader priority, but filesystem rotation still occurs in the
+capture task, so scheduling alone does not prove gap-free audio.
 
 ## 10. Configuration and secret boundaries
 
@@ -361,15 +389,17 @@ Upload is enabled only when SSID, password, endpoint, and token are all present.
 The current same-LAN URL is configuration, not a second protocol. Public
 Internet use would require HTTPS and is outside this same-LAN acceptance setup.
 
-The receiver reads `CLOUD_COLLECTION_TOKEN` and optional
-`CLOUD_AUDIO_SEGMENT_DIR` environment variables. No real password or token
-value belongs in source, tracked defaults, documentation, test output, or
-logs. Logs may contain non-secret device/run IDs, segment indexes, counters,
-and artifact paths.
+The receiver requires a nonblank `CLOUD_COLLECTION_TOKEN` matching the device
+token and reads the optional `CLOUD_AUDIO_SEGMENT_DIR` environment variable.
+It fails closed with HTTP 503 before artifact creation when its token setting
+is absent or blank. No real password or token value belongs in source, tracked
+defaults, documentation, test output, responses, or logs. Logs may contain
+non-secret device/run IDs, segment indexes, counters, and artifact paths.
 
-**Current gap:** `wifi_manager` logs the configured SSID after station startup.
-Because the spec treats Wi-Fi credentials as non-loggable, that value must be
-removed or redacted before I3 is complete.
+Receiver token enforcement for I4 is implemented and covered by tests.
+**Remaining I3 gap:** `wifi_manager` logs the configured SSID after station
+startup. Because the spec treats Wi-Fi credentials as non-loggable, that value
+must be removed or redacted before I3 is complete.
 
 ## 11. Verification strategy
 
@@ -378,7 +408,7 @@ removed or redacted before I3 is complete.
 | Scope | Gate | What it establishes |
 | --- | --- | --- |
 | Documentation | Relative links/Markdown inspection and `git diff --check` | Document integrity only. |
-| Receiver | `python -m pytest -q cloud/tests` | Valid upload, ACK, artifact creation, duplicate handling, gaps, counters, checksum/WAV rejection, and token enforcement. |
+| Receiver | `python -m pytest -q cloud/tests` | Valid upload, ACK, artifact creation, duplicate handling, gaps, counters, checksum/WAV rejection, and fail-closed 401/503/403 token behavior with no artifacts on rejection. |
 | Firmware | `idf.py build` in an activated ESP-IDF environment | Source/configuration compile; no hardware behavior. |
 
 ### Physical proof
@@ -391,7 +421,14 @@ Wi-Fi interruption, and sleep/double-tap wake. Evidence should include the run
 ID, receiver `summary.json`, ordered WAV files, observed device counts, timing,
 and listening result.
 
-No software-only result can mark the demo Complete.
+Targeted storage-safety evidence must also show that an active WAV is never
+posted; Start is rejected while upload or ACK cleanup owns the namespace and
+succeeds after cleanup; HTTP failure preserves the WAV and canonical sidecar;
+a reboot resumes a closed segment; and a valid temporary sidecar is promoted.
+
+K1-K9 are necessary but are not sufficient by themselves. No software-only
+result can mark the demo Complete: every A1-J5 requirement needs its applicable
+evidence and every K1-K9 condition needs physical-board evidence.
 
 ## 12. Current implementation status and known gaps
 
@@ -400,16 +437,19 @@ No software-only result can mark the demo Complete.
 | Board, display, microphone/I2S, SPIFFS initialization | **Implemented / Unverified** | Board-specific source exists and firmware compiles; capture quality requires the board. |
 | PCM WAV creation and 10-second rotation | **Implemented / Unverified** | Header, persistence, rotation, and final partial exist; boundary quality is untested physically. |
 | STA Wi-Fi and reconnect | **Implemented / Partial** | Event-driven connection exists; UI starts Ready before connection and Start is not gated. |
-| Sequential upload, retry, durable closed files | **Implemented / Unverified** | One worker, metadata scan, ACK matching, and delete-after-ACK exist; live Wi-Fi behavior is untested. |
-| Minimal receiver | **Implemented** | Route, validation, idempotence, artifacts, summaries, and receiver tests exist. |
+| Sequential upload and closed-file isolation | **Implemented / Unverified** | One worker, shared strict validator, path reservations, ACK matching, and WAV-first cleanup exist; active-file and live Wi-Fi behavior need physical proof. |
+| Retry metadata and interrupted commit recovery | **Implemented / Unverified** | Canonical metadata is write-once, retries update RAM/headers, and a valid temporary sidecar can be promoted; failure/reboot behavior needs physical proof. |
+| Reboot durability | **Partial** | Scanning/recovery exists, but mount-time formatting, SPIFFS-wide power-loss corruption, and missing physical reboot evidence keep F3 incomplete. |
+| Minimal receiver | **Implemented** | Route, fail-closed token validation, idempotence, artifacts, summaries, and 401/503/403 receiver tests exist. |
 | Start/Stop-only interface | **Implemented** | No Play or local playback path remains. |
 | Wi-Fi status and upload counts | **Partial** | Recorder counters exist, but the UI does not show Wi-Fi, uploaded, or pending values. |
 | Upload error status | **Partial** | The uploader retries and counts failures, but the UI receives no failure status. |
 | Post-Stop progression | **Partial** | Capture stops and uploads continue, but the UI returns to Ready without `Stopped · uploading N` or Complete. |
-| Second-session safety and run identity | **Partial** | Start is re-enabled before pending files clear; index-only paths can collide, and the boot-relative run ID is not guaranteed unique across reboot. |
-| Configuration and secret handling | **Partial** | Local `sdkconfig` is ignored and token/password values are not logged, but the configured SSID is currently logged. |
+| Second-session storage safety | **Implemented / Unverified** | The UI enables Start early, but the recorder rejects it until all artifacts/reservations clear; physical rejection/cleanup/restart evidence is missing. |
+| Run identity and completion UI | **Partial** | The boot-relative run ID is not guaranteed unique across reboot, and the UI still lacks pending/Complete progression. |
+| Configuration and secret handling | **Partial** | Receiver token enforcement fails closed and local `sdkconfig` is ignored, but the configured SSID is currently logged. |
 | Display sleep and double-tap wake | **Implemented / Unverified** | Code preserves session state, but K9 has no physical evidence. |
-| K1–K9 acceptance set | **Unverified** | No complete physical-board evidence set is recorded; the demo must not be declared complete. |
+| A1-J5 plus K1-K9 completion gate | **Partial / Unverified** | Normative gaps remain and no complete physical-board K evidence set is recorded; the demo must not be declared complete. |
 
 ## 13. Key tradeoffs
 
@@ -419,7 +459,7 @@ No software-only result can mark the demo Complete.
 | Uncompressed WAV/PCM | No codec risk and universal cloud readability | About 640 KB per nominal segment |
 | 10-second fixed segments | Frequent feedback and manageable outage queue | May cut through words; request overhead is higher than longer segments |
 | One sequential uploader | Deterministic ordering and simple ownership | No parallel upload acceleration |
-| SPIFFS plus metadata sidecars | Reboot-visible queue without another service | Short buffering only; index namespace needs session gating |
+| SPIFFS plus metadata sidecars | Reboot-visible queue without another service | Short buffering only; strict session gating and unresolved filesystem-level power-loss risk |
 | Filesystem FastAPI receiver | Easy inspection and playback | One-device demo only; no production retention or scaling |
 | Shared demo token | Minimal access boundary | Not user authentication or production security |
 
@@ -443,29 +483,32 @@ requirements.
 | C2, C3, C4 | Sections 1, 13 | Future gates only; no codec is present |
 | D1, D8 | Sections 4, 10 | Implemented fixed configured duration |
 | D2, D3, D5, D7 | Sections 4, 11 | Lifecycle exists; boundary and duration decision unverified |
-| D4, D6 | Sections 4, 6 | Implemented closed-only upload and final partial |
+| D4 | Sections 4, 5, 9 | Strict closed-file validation and reservations implemented; physical active-file exclusion unverified |
+| D6 | Sections 4, 6 | Final partial closure implemented; physical behavior unverified |
 | E1, E2 | Sections 5, 10 | Implemented STA auto-connect configuration |
 | E3 | Sections 3, 12 | Partial; Start gating is missing |
-| E4, E5, E7, E9 | Sections 5, 8, 9 | Implemented path; concurrent hardware proof unverified |
+| E4, E5, E7 | Sections 5, 8, 9 | Implemented path; concurrent hardware proof unverified |
+| E9 | Sections 4, 5, 8 | Failed transport leaves write-once WAV/canonical metadata intact; physical failure proof unverified |
 | E6 | Sections 2, 6 | Implemented HTTP POST only |
 | E8 | Sections 5, 11 | Unverified throughput requirement |
 | E10 | Sections 2, 10 | Same-LAN HTTP implemented; public use requires HTTPS |
-| F1, F2 | Sections 6, 8 | Implemented matching-ACK retention/deletion |
-| F3 | Sections 5, 8 | Partial; metadata scan exists, but reboot is unverified and mount failure may format storage |
+| F1, F2 | Sections 6, 8 | Implemented matching-ACK retention and WAV-first local cleanup without reposting |
+| F3 | Sections 5, 8, 12 | Partial; canonical/tmp recovery exists, but reboot is unverified and mount formatting or SPIFFS-wide corruption may erase storage |
 | F4 | Section 8 | Intentional demo limitation |
-| F5 | Sections 8, 12 | Partial; overwrite refusal exists, but cross-run namespace and mount-failure safety do not |
+| F5 | Sections 4, 5, 8, 12 | Partial; reservations, Start gating, and ambiguous-artifact preservation prevent silent reuse, but filesystem-level erasure risks remain |
 | F6 | Sections 8, 12 | Partial; visible error exists, but abort removes the unfinished active WAV |
 | F7 | Sections 1, 13 | Required short-buffer limit; no long-offline claim |
 | F8 | Sections 3, 8 | Capture stop/upload continuation implemented; UI partial |
 | G1, G2 | Sections 3, 12 | Implemented Start/Stop only; playback absent |
 | G3, G5, G6, G7 | Sections 3, 12 | Partial; required status/count states missing |
 | G4, G8 | Sections 3, 12 | Implemented in code; display behavior unverified physically |
-| G9 | Sections 3, 8, 12 | Partial; zero-pending second-session gate missing |
+| G9 | Sections 3, 8, 12 | Recorder gate implemented; pending/cleanup rejection and later Start need physical verification |
 | H1, H7, H8, H9 | Sections 1, 7 | Implemented minimal one-device receiver scope |
 | H2, H3 | Sections 4, 7, 8 | Run/index metadata implemented; reboot-safe identity and second-run isolation partial |
 | H4, H5, H6 | Sections 6, 7, 11 | Implemented and covered by receiver tests |
 | I1, I2 | Section 10 | Implemented local ESP-IDF configuration; no provisioning UI |
-| I3, I4 | Section 10 | Partial; demo-token boundary exists, but the configured SSID is logged |
+| I3 | Sections 10, 12 | Partial; tokens are fail-closed and not logged, but the configured SSID is logged |
+| I4 | Sections 6, 10, 11 | Implemented demo-token boundary with fail-closed receiver tests |
 | I5, I6 | Section 3 | Start/Stop and awake Recording indicator implemented; physical behavior unverified |
 | I7, I8 | Sections 7, 10 | Implemented raw-audio/manual-retention demo boundary |
 | J1, J2, J3, J5 | Sections 1, 13 | Fixed scope constraints; no battery/Bluetooth optimization |

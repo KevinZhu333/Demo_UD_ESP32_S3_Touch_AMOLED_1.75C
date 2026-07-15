@@ -44,6 +44,11 @@ export CLOUD_COLLECTION_TOKEN="replace-with-the-device-token"
 uvicorn cloud.api.audio_receiver:app --host 0.0.0.0 --port 8000
 ```
 
+`CLOUD_COLLECTION_TOKEN` is required and must be nonblank and match the token
+configured on the device. If it is absent, empty, or whitespace-only, the
+receiver rejects every upload with HTTP 503; token values are never logged or
+included in error responses.
+
 Accepted WAV files and their summaries are written to
 `device-audio-segments/` by default. Set `CLOUD_AUDIO_SEGMENT_DIR` to use a
 different local directory.

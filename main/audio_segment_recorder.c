@@ -1,11 +1,13 @@
 #include "audio_segment_recorder.h"
 
 #include <dirent.h>
+#include <errno.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "cJSON.h"
 #include "esp_http_client.h"
@@ -70,10 +72,19 @@ typedef struct {
     uint32_t upload_retry_count;
 } upload_segment_t;
 
+/* When both are needed, take segment_mutex before storage_mutex. */
 static SemaphoreHandle_t segment_mutex;
+/* Protects namespace operations and path reservations, never network I/O. */
+static SemaphoreHandle_t storage_mutex;
 static QueueHandle_t upload_queue;
 static TaskHandle_t upload_task_handle;
+static portMUX_TYPE runtime_init_spinlock = portMUX_INITIALIZER_UNLOCKED;
+static bool runtime_objects_initializing;
+static bool runtime_objects_ready;
+static bool upload_task_starting;
 static active_segment_t active_segment;
+static char active_storage_path[SEGMENT_PATH_LEN];
+static char upload_storage_path[SEGMENT_PATH_LEN];
 static bool recorder_active;
 static bool upload_task_started;
 static audio_segment_recorder_stats_t recorder_stats;
@@ -90,6 +101,19 @@ static void put_le32(uint8_t *dest, uint32_t value)
     dest[1] = (uint8_t)((value >> 8) & 0xff);
     dest[2] = (uint8_t)((value >> 16) & 0xff);
     dest[3] = (uint8_t)((value >> 24) & 0xff);
+}
+
+static uint16_t get_le16(const uint8_t *src)
+{
+    return (uint16_t)src[0] | ((uint16_t)src[1] << 8);
+}
+
+static uint32_t get_le32(const uint8_t *src)
+{
+    return (uint32_t)src[0] |
+           ((uint32_t)src[1] << 8) |
+           ((uint32_t)src[2] << 16) |
+           ((uint32_t)src[3] << 24);
 }
 
 static void build_wav_header(uint8_t header[WAV_HEADER_SIZE], uint32_t data_bytes)
@@ -135,27 +159,84 @@ static void segment_unlock(void)
     }
 }
 
+static void storage_lock(void)
+{
+    if (storage_mutex != NULL)
+    {
+        xSemaphoreTake(storage_mutex, portMAX_DELAY);
+    }
+}
+
+static void storage_unlock(void)
+{
+    if (storage_mutex != NULL)
+    {
+        xSemaphoreGive(storage_mutex);
+    }
+}
+
 static esp_err_t ensure_runtime_objects(void)
 {
-    if (segment_mutex == NULL)
+    while (1)
     {
-        segment_mutex = xSemaphoreCreateMutex();
-        if (segment_mutex == NULL)
+        bool initialize = false;
+        taskENTER_CRITICAL(&runtime_init_spinlock);
+        if (runtime_objects_ready)
         {
-            return ESP_ERR_NO_MEM;
+            taskEXIT_CRITICAL(&runtime_init_spinlock);
+            return ESP_OK;
         }
-    }
-
-    if (upload_queue == NULL)
-    {
-        upload_queue = xQueueCreate(SEGMENT_UPLOAD_QUEUE_LEN, sizeof(upload_segment_t));
-        if (upload_queue == NULL)
+        if (!runtime_objects_initializing)
         {
-            return ESP_ERR_NO_MEM;
+            runtime_objects_initializing = true;
+            initialize = true;
         }
-    }
+        taskEXIT_CRITICAL(&runtime_init_spinlock);
 
-    return ESP_OK;
+        if (!initialize)
+        {
+            vTaskDelay(1);
+            continue;
+        }
+
+        SemaphoreHandle_t new_segment_mutex = xSemaphoreCreateMutex();
+        SemaphoreHandle_t new_storage_mutex = xSemaphoreCreateMutex();
+        QueueHandle_t new_upload_queue =
+            xQueueCreate(SEGMENT_UPLOAD_QUEUE_LEN, sizeof(upload_segment_t));
+        esp_err_t ret = new_segment_mutex != NULL &&
+                                new_storage_mutex != NULL &&
+                                new_upload_queue != NULL
+                            ? ESP_OK
+                            : ESP_ERR_NO_MEM;
+
+        if (ret != ESP_OK)
+        {
+            if (new_segment_mutex != NULL)
+            {
+                vSemaphoreDelete(new_segment_mutex);
+            }
+            if (new_storage_mutex != NULL)
+            {
+                vSemaphoreDelete(new_storage_mutex);
+            }
+            if (new_upload_queue != NULL)
+            {
+                vQueueDelete(new_upload_queue);
+            }
+        }
+
+        taskENTER_CRITICAL(&runtime_init_spinlock);
+        if (ret == ESP_OK)
+        {
+            segment_mutex = new_segment_mutex;
+            storage_mutex = new_storage_mutex;
+            upload_queue = new_upload_queue;
+            runtime_objects_ready = true;
+        }
+        runtime_objects_initializing = false;
+        taskEXIT_CRITICAL(&runtime_init_spinlock);
+        return ret;
+    }
 }
 
 static esp_err_t ensure_segment_storage(void)
@@ -229,36 +310,127 @@ static void segment_meta_path_for_upload(const upload_segment_t *segment, char *
     segment_meta_path_for_index(dest, dest_len, segment->segment_index);
 }
 
-static bool parse_segment_meta_name(const char *name, uint32_t *segment_index)
+static void segment_tmp_meta_path_for_index(char *dest, size_t dest_len, uint32_t segment_index)
 {
-    if (name == NULL || segment_index == NULL)
+    char meta_path[SEGMENT_PATH_LEN];
+    segment_meta_path_for_index(meta_path, sizeof(meta_path), segment_index);
+    snprintf(dest, dest_len, "%s" SEGMENT_TMP_SUFFIX, meta_path);
+}
+
+static bool parse_segment_name(const char *name, const char *suffix, uint32_t *segment_index)
+{
+    if (name == NULL || suffix == NULL || segment_index == NULL)
     {
         return false;
     }
 
-    uint32_t parsed = 0;
-    char suffix[sizeof(SEGMENT_META_SUFFIX)] = {0};
-    if (sscanf(name, SEGMENT_NAME_PREFIX "%" SCNu32 "%10s", &parsed, suffix) != 2)
+    const size_t prefix_len = sizeof(SEGMENT_NAME_PREFIX) - 1;
+    if (strncmp(name, SEGMENT_NAME_PREFIX, prefix_len) != 0)
     {
         return false;
     }
-    if (parsed == 0 || strcmp(suffix, SEGMENT_META_SUFFIX) != 0)
+
+    errno = 0;
+    char *end = NULL;
+    unsigned long parsed = strtoul(name + prefix_len, &end, 10);
+    if (errno != 0 || end == name + prefix_len || parsed == 0 || parsed > UINT32_MAX || strcmp(end, suffix) != 0)
     {
         return false;
     }
 
     char expected[64];
-    snprintf(expected, sizeof(expected), SEGMENT_NAME_PREFIX "%06" PRIu32 SEGMENT_META_SUFFIX, parsed);
+    snprintf(expected, sizeof(expected), SEGMENT_NAME_PREFIX "%06" PRIu32 "%s", (uint32_t)parsed, suffix);
     if (strcmp(name, expected) != 0)
     {
         return false;
     }
 
-    *segment_index = parsed;
+    *segment_index = (uint32_t)parsed;
     return true;
 }
 
-static esp_err_t write_segment_metadata(const upload_segment_t *segment)
+static bool parse_segment_meta_name(const char *name, uint32_t *segment_index)
+{
+    return parse_segment_name(name, SEGMENT_META_SUFFIX, segment_index);
+}
+
+static bool parse_segment_tmp_meta_name(const char *name, uint32_t *segment_index)
+{
+    return parse_segment_name(name, SEGMENT_META_SUFFIX SEGMENT_TMP_SUFFIX, segment_index);
+}
+
+static bool parse_segment_wav_name(const char *name, uint32_t *segment_index)
+{
+    return parse_segment_name(name, SEGMENT_WAV_SUFFIX, segment_index);
+}
+
+static esp_err_t read_segment_metadata_path(const char *meta_path,
+                                            uint32_t segment_index,
+                                            upload_segment_t *segment);
+
+static bool segment_identity_matches(const upload_segment_t *left, const upload_segment_t *right)
+{
+    return left != NULL && right != NULL &&
+           left->segment_index == right->segment_index &&
+           left->segment_start_ms == right->segment_start_ms &&
+           left->data_bytes == right->data_bytes &&
+           left->duration_ms == right->duration_ms &&
+           strcmp(left->path, right->path) == 0 &&
+           strcmp(left->run_id, right->run_id) == 0;
+}
+
+static esp_err_t validate_finalized_wav(const upload_segment_t *segment)
+{
+    const uint32_t block_align = CHANNELS * BITS_PER_SAMPLE / 8;
+    if (segment == NULL ||
+        segment->data_bytes == 0 ||
+        segment->data_bytes > UINT32_MAX - WAV_HEADER_SIZE ||
+        segment->data_bytes % block_align != 0)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    struct stat st;
+    if (stat(segment->path, &st) != 0 ||
+        (uint64_t)st.st_size != (uint64_t)WAV_HEADER_SIZE + segment->data_bytes)
+    {
+        return ESP_FAIL;
+    }
+
+    FILE *fp = fopen(segment->path, "rb");
+    if (fp == NULL)
+    {
+        return ESP_FAIL;
+    }
+
+    uint8_t header[WAV_HEADER_SIZE];
+    size_t read_len = fread(header, 1, sizeof(header), fp);
+    int close_ret = fclose(fp);
+    if (read_len != sizeof(header) || close_ret != 0)
+    {
+        return ESP_FAIL;
+    }
+
+    uint32_t expected_duration_ms =
+        (uint32_t)(((uint64_t)segment->data_bytes * 1000ULL) / BYTES_PER_SECOND);
+    bool valid = memcmp(&header[0], "RIFF", 4) == 0 &&
+                 get_le32(&header[4]) == 36U + segment->data_bytes &&
+                 memcmp(&header[8], "WAVE", 4) == 0 &&
+                 memcmp(&header[12], "fmt ", 4) == 0 &&
+                 get_le32(&header[16]) == 16 &&
+                 get_le16(&header[20]) == WAV_PCM_FORMAT &&
+                 get_le16(&header[22]) == CHANNELS &&
+                 get_le32(&header[24]) == SAMPLE_RATE &&
+                 get_le32(&header[28]) == BYTES_PER_SECOND &&
+                 get_le16(&header[32]) == CHANNELS * BITS_PER_SAMPLE / 8 &&
+                 get_le16(&header[34]) == BITS_PER_SAMPLE &&
+                 memcmp(&header[36], "data", 4) == 0 &&
+                 get_le32(&header[40]) == segment->data_bytes &&
+                 segment->duration_ms == expected_duration_ms;
+    return valid ? ESP_OK : ESP_FAIL;
+}
+
+static esp_err_t write_segment_metadata_once(const upload_segment_t *segment)
 {
     if (segment == NULL || segment->segment_index == 0 || segment->run_id[0] == '\0')
     {
@@ -268,7 +440,21 @@ static esp_err_t write_segment_metadata(const upload_segment_t *segment)
     char meta_path[SEGMENT_PATH_LEN];
     char tmp_path[SEGMENT_PATH_LEN];
     segment_meta_path_for_upload(segment, meta_path, sizeof(meta_path));
-    snprintf(tmp_path, sizeof(tmp_path), "%s" SEGMENT_TMP_SUFFIX, meta_path);
+    segment_tmp_meta_path_for_index(tmp_path, sizeof(tmp_path), segment->segment_index);
+
+    struct stat st;
+    errno = 0;
+    if (stat(meta_path, &st) == 0 || errno != ENOENT)
+    {
+        ESP_LOGE(TAG, "Refusing to replace segment metadata: %s", meta_path);
+        return ESP_ERR_INVALID_STATE;
+    }
+    errno = 0;
+    if (stat(tmp_path, &st) == 0 || errno != ENOENT)
+    {
+        ESP_LOGE(TAG, "Refusing to overwrite temporary segment metadata: %s", tmp_path);
+        return ESP_ERR_INVALID_STATE;
+    }
 
     cJSON *root = cJSON_CreateObject();
     if (root == NULL)
@@ -307,19 +493,35 @@ static esp_err_t write_segment_metadata(const upload_segment_t *segment)
     }
     size_t len = strlen(json);
     size_t written = fwrite(json, 1, len, fp);
+    int flush_ret = fflush(fp);
+    int sync_ret = flush_ret == 0 ? fsync(fileno(fp)) : -1;
     int close_ret = fclose(fp);
     free(json);
-    if (written != len || close_ret != 0)
+    if (written != len || flush_ret != 0 || sync_ret != 0 || close_ret != 0)
     {
-        remove(tmp_path);
         ret = ESP_FAIL;
         goto cleanup;
     }
 
-    remove(meta_path);
+    upload_segment_t persisted = {0};
+    if (read_segment_metadata_path(tmp_path, segment->segment_index, &persisted) != ESP_OK ||
+        !segment_identity_matches(segment, &persisted) ||
+        validate_finalized_wav(&persisted) != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Temporary segment metadata failed validation: %s", tmp_path);
+        ret = ESP_FAIL;
+        goto cleanup;
+    }
+
+    errno = 0;
+    if (stat(meta_path, &st) == 0 || errno != ENOENT)
+    {
+        ESP_LOGE(TAG, "Canonical segment metadata appeared before promotion: %s", meta_path);
+        ret = ESP_ERR_INVALID_STATE;
+        goto cleanup;
+    }
     if (rename(tmp_path, meta_path) != 0)
     {
-        remove(tmp_path);
         ret = ESP_FAIL;
     }
 
@@ -350,15 +552,14 @@ static bool json_u64(cJSON *root, const char *key, uint64_t *value)
     return true;
 }
 
-static esp_err_t read_segment_metadata(uint32_t segment_index, upload_segment_t *segment)
+static esp_err_t read_segment_metadata_path(const char *meta_path,
+                                            uint32_t segment_index,
+                                            upload_segment_t *segment)
 {
-    if (segment == NULL || segment_index == 0)
+    if (meta_path == NULL || segment == NULL || segment_index == 0)
     {
         return ESP_ERR_INVALID_ARG;
     }
-
-    char meta_path[SEGMENT_PATH_LEN];
-    segment_meta_path_for_index(meta_path, sizeof(meta_path), segment_index);
 
     FILE *fp = fopen(meta_path, "rb");
     if (fp == NULL)
@@ -431,18 +632,194 @@ cleanup:
     return ret;
 }
 
-static esp_err_t open_active_segment(uint32_t segment_index)
+static esp_err_t path_presence(const char *path, bool *present)
+{
+    if (path == NULL || present == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    struct stat st;
+    if (stat(path, &st) == 0)
+    {
+        *present = true;
+        return ESP_OK;
+    }
+    if (errno == ENOENT)
+    {
+        *present = false;
+        return ESP_OK;
+    }
+    return ESP_FAIL;
+}
+
+static esp_err_t remove_path_if_present(const char *path)
+{
+    if (remove(path) == 0 || errno == ENOENT)
+    {
+        return ESP_OK;
+    }
+    return ESP_FAIL;
+}
+
+static esp_err_t load_pending_segment(uint32_t segment_index, upload_segment_t *segment)
+{
+    if (segment == NULL || segment_index == 0)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    char wav_path[SEGMENT_PATH_LEN];
+    char meta_path[SEGMENT_PATH_LEN];
+    char tmp_path[SEGMENT_PATH_LEN];
+    segment_wav_path(wav_path, sizeof(wav_path), segment_index);
+    segment_meta_path_for_index(meta_path, sizeof(meta_path), segment_index);
+    segment_tmp_meta_path_for_index(tmp_path, sizeof(tmp_path), segment_index);
+
+    bool wav_exists = false;
+    bool meta_exists = false;
+    bool tmp_exists = false;
+    if (path_presence(wav_path, &wav_exists) != ESP_OK ||
+        path_presence(meta_path, &meta_exists) != ESP_OK ||
+        path_presence(tmp_path, &tmp_exists) != ESP_OK)
+    {
+        ESP_LOGE(TAG,
+                 "Unable to inspect pending segment artifacts segment_index=%" PRIu32,
+                 segment_index);
+        return ESP_FAIL;
+    }
+
+    if (!wav_exists)
+    {
+        if (meta_exists || tmp_exists)
+        {
+            ESP_LOGE(TAG,
+                     "Preserving metadata without WAV as ambiguous segment_index=%" PRIu32,
+                     segment_index);
+            return ESP_FAIL;
+        }
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    if (meta_exists && tmp_exists)
+    {
+        ESP_LOGE(TAG,
+                 "Preserving canonical and temporary metadata as ambiguous segment_index=%" PRIu32,
+                 segment_index);
+        return ESP_FAIL;
+    }
+
+    if (meta_exists)
+    {
+        upload_segment_t canonical = {0};
+        if (read_segment_metadata_path(meta_path, segment_index, &canonical) != ESP_OK ||
+            validate_finalized_wav(&canonical) != ESP_OK)
+        {
+            ESP_LOGE(TAG,
+                     "Preserving invalid or ambiguous canonical metadata segment_index=%" PRIu32,
+                     segment_index);
+            return ESP_FAIL;
+        }
+
+        *segment = canonical;
+        return ESP_OK;
+    }
+
+    if (tmp_exists)
+    {
+        upload_segment_t recovered = {0};
+        if (read_segment_metadata_path(tmp_path, segment_index, &recovered) != ESP_OK ||
+            validate_finalized_wav(&recovered) != ESP_OK)
+        {
+            ESP_LOGE(TAG,
+                     "Preserving invalid or ambiguous temporary metadata segment_index=%" PRIu32,
+                     segment_index);
+            return ESP_FAIL;
+        }
+
+        if (rename(tmp_path, meta_path) != 0)
+        {
+            ESP_LOGW(TAG, "Failed to promote recovered segment metadata: %s", tmp_path);
+            return ESP_FAIL;
+        }
+        ESP_LOGI(TAG,
+                 "Recovered interrupted segment metadata commit segment_index=%" PRIu32,
+                 segment_index);
+        *segment = recovered;
+        return ESP_OK;
+    }
+
+    ESP_LOGE(TAG,
+             "Preserving finalized WAV without recoverable metadata path=%s segment_index=%" PRIu32,
+             wav_path,
+             segment_index);
+    return ESP_FAIL;
+}
+
+static esp_err_t ensure_no_segment_artifacts_locked(void)
+{
+    if (active_storage_path[0] != '\0' || upload_storage_path[0] != '\0')
+    {
+        ESP_LOGW(TAG, "Recording start blocked by active storage reservation");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    DIR *dir = opendir(SEGMENT_STORAGE_ROOT);
+    if (dir == NULL)
+    {
+        return ESP_FAIL;
+    }
+
+    esp_err_t ret = ESP_OK;
+    struct dirent *entry = NULL;
+    while ((entry = readdir(dir)) != NULL)
+    {
+        uint32_t segment_index = 0;
+        if (parse_segment_wav_name(entry->d_name, &segment_index) ||
+            parse_segment_meta_name(entry->d_name, &segment_index) ||
+            parse_segment_tmp_meta_name(entry->d_name, &segment_index))
+        {
+            ESP_LOGW(TAG,
+                     "Recording start blocked by pending segment artifact name=%s segment_index=%" PRIu32,
+                     entry->d_name,
+                     segment_index);
+            ret = ESP_ERR_INVALID_STATE;
+            break;
+        }
+    }
+    closedir(dir);
+    return ret;
+}
+
+static esp_err_t open_active_segment_locked(uint32_t segment_index)
 {
     memset(&active_segment, 0, sizeof(active_segment));
     active_segment.segment_index = segment_index;
     active_segment.segment_start_ms = segment_start_ms_for_index(segment_index);
     segment_wav_path(active_segment.path, sizeof(active_segment.path), segment_index);
 
-    struct stat st;
-    if (stat(active_segment.path, &st) == 0)
+    char meta_path[SEGMENT_PATH_LEN];
+    char tmp_path[SEGMENT_PATH_LEN];
+    segment_meta_path_for_index(meta_path, sizeof(meta_path), segment_index);
+    segment_tmp_meta_path_for_index(tmp_path, sizeof(tmp_path), segment_index);
+
+    bool wav_exists = false;
+    bool meta_exists = false;
+    bool tmp_exists = false;
+    if (path_presence(active_segment.path, &wav_exists) != ESP_OK ||
+        path_presence(meta_path, &meta_exists) != ESP_OK ||
+        path_presence(tmp_path, &tmp_exists) != ESP_OK)
+    {
+        recorder_stats.storage_overflow_count++;
+        return ESP_FAIL;
+    }
+
+    if ((upload_storage_path[0] != '\0' &&
+         strcmp(upload_storage_path, active_segment.path) == 0) ||
+        wav_exists || meta_exists || tmp_exists)
     {
         ESP_LOGE(TAG,
-                 "Refusing to overwrite unacked audio segment path=%s segment_index=%" PRIu32,
+                 "Refusing to reuse pending audio segment slot path=%s segment_index=%" PRIu32,
                  active_segment.path,
                  segment_index);
         recorder_stats.storage_overflow_count++;
@@ -466,6 +843,8 @@ static esp_err_t open_active_segment(uint32_t segment_index)
         recorder_stats.local_gap_count++;
         return ret;
     }
+
+    snprintf(active_storage_path, sizeof(active_storage_path), "%s", active_segment.path);
 
     recorder_stats.segments_started++;
     recorder_stats.last_segment_index = segment_index;
@@ -509,6 +888,15 @@ static esp_err_t finalize_active_segment(bool enqueue)
         return ESP_ERR_INVALID_STATE;
     }
 
+    storage_lock();
+    if (active_storage_path[0] == '\0' ||
+        strcmp(active_storage_path, active_segment.path) != 0)
+    {
+        storage_unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
+    storage_unlock();
+
     uint32_t data_bytes = active_segment.data_bytes;
     esp_err_t ret = ESP_OK;
     if (fseek(active_segment.fp, 0, SEEK_SET) != 0)
@@ -524,6 +912,10 @@ static esp_err_t finalize_active_segment(bool enqueue)
     {
         ret = ESP_FAIL;
     }
+    if (ret == ESP_OK && fsync(fileno(active_segment.fp)) != 0)
+    {
+        ret = ESP_FAIL;
+    }
     if (fclose(active_segment.fp) != 0)
     {
         ret = ESP_FAIL;
@@ -532,6 +924,9 @@ static esp_err_t finalize_active_segment(bool enqueue)
 
     if (ret != ESP_OK)
     {
+        storage_lock();
+        active_storage_path[0] = '\0';
+        storage_unlock();
         recorder_stats.local_gap_count++;
         ESP_LOGE(TAG,
                  "Failed to finalize segment run_id=%s segment_index=%" PRIu32,
@@ -543,7 +938,14 @@ static esp_err_t finalize_active_segment(bool enqueue)
     recorder_stats.segments_finalized++;
     if (!enqueue || data_bytes == 0)
     {
-        return ESP_OK;
+        storage_lock();
+        if (data_bytes == 0 && remove_path_if_present(active_segment.path) != ESP_OK)
+        {
+            ret = ESP_FAIL;
+        }
+        active_storage_path[0] = '\0';
+        storage_unlock();
+        return ret;
     }
 
     upload_segment_t upload = {0};
@@ -563,9 +965,12 @@ static esp_err_t finalize_active_segment(bool enqueue)
              upload.segment_index,
              upload.duration_ms,
              upload.data_bytes);
-    ret = write_segment_metadata(&upload);
+    ret = write_segment_metadata_once(&upload);
     if (ret != ESP_OK)
     {
+        storage_lock();
+        active_storage_path[0] = '\0';
+        storage_unlock();
         recorder_stats.local_gap_count++;
         ESP_LOGE(TAG,
                  "Failed to persist segment metadata run_id=%s segment_index=%" PRIu32,
@@ -573,7 +978,11 @@ static esp_err_t finalize_active_segment(bool enqueue)
                  upload.segment_index);
         return ret;
     }
-    return enqueue_finalized_segment(&upload);
+    storage_lock();
+    ret = enqueue_finalized_segment(&upload);
+    active_storage_path[0] = '\0';
+    storage_unlock();
+    return ret;
 }
 
 static esp_err_t rotate_active_segment(void)
@@ -585,7 +994,10 @@ static esp_err_t rotate_active_segment(void)
         return ret;
     }
 
-    return open_active_segment(next_index);
+    storage_lock();
+    ret = open_active_segment_locked(next_index);
+    storage_unlock();
+    return ret;
 }
 
 static esp_err_t sha256_file(const char *path, char hex[65], size_t *file_size)
@@ -847,18 +1259,123 @@ static esp_err_t upload_segment_file(upload_segment_t *segment)
     return ret;
 }
 
-static void delete_uploaded_segment(const upload_segment_t *segment)
+static void release_upload_path(const char *path)
 {
+    storage_lock();
+    if (path != NULL && upload_storage_path[0] != '\0' &&
+        strcmp(upload_storage_path, path) == 0)
+    {
+        upload_storage_path[0] = '\0';
+    }
+    storage_unlock();
+}
+
+static esp_err_t reserve_segment_for_upload(upload_segment_t *segment)
+{
+    if (segment == NULL || segment->segment_index == 0)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    char expected_path[SEGMENT_PATH_LEN];
+    segment_wav_path(expected_path, sizeof(expected_path), segment->segment_index);
+    if (segment->path[0] != '\0' && strcmp(segment->path, expected_path) != 0)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    bool has_queued_identity = segment->run_id[0] != '\0';
+    storage_lock();
+    if (upload_storage_path[0] != '\0')
+    {
+        storage_unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (active_storage_path[0] != '\0' &&
+        strcmp(active_storage_path, expected_path) == 0)
+    {
+        ESP_LOGE(TAG,
+                 "Refusing to upload active WAV path=%s segment_index=%" PRIu32,
+                 expected_path,
+                 segment->segment_index);
+        storage_unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    snprintf(upload_storage_path, sizeof(upload_storage_path), "%s", expected_path);
+    storage_unlock();
+
+    upload_segment_t persisted = {0};
+    esp_err_t ret = load_pending_segment(segment->segment_index, &persisted);
+    if (ret != ESP_OK ||
+        (has_queued_identity && !segment_identity_matches(segment, &persisted)))
+    {
+        if (ret == ESP_OK && has_queued_identity)
+        {
+            ESP_LOGW(TAG,
+                     "Discarding stale queued segment identity run_id=%s segment_index=%" PRIu32,
+                     segment->run_id,
+                     segment->segment_index);
+            ret = ESP_ERR_INVALID_STATE;
+        }
+        release_upload_path(expected_path);
+        return ret;
+    }
+
+    if (!has_queued_identity)
+    {
+        *segment = persisted;
+    }
+    return ESP_OK;
+}
+
+static void release_upload_reservation(const upload_segment_t *segment)
+{
+    release_upload_path(segment != NULL ? segment->path : NULL);
+}
+
+static esp_err_t cleanup_acked_segment(const upload_segment_t *segment)
+{
+    if (segment == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
     char meta_path[SEGMENT_PATH_LEN];
+    char tmp_path[SEGMENT_PATH_LEN];
     segment_meta_path_for_upload(segment, meta_path, sizeof(meta_path));
-    if (remove(segment->path) != 0)
+    segment_tmp_meta_path_for_index(tmp_path, sizeof(tmp_path), segment->segment_index);
+
+    storage_lock();
+    if (upload_storage_path[0] == '\0' ||
+        strcmp(upload_storage_path, segment->path) != 0 ||
+        (active_storage_path[0] != '\0' &&
+         strcmp(active_storage_path, segment->path) == 0))
+    {
+        storage_unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (remove_path_if_present(segment->path) != ESP_OK)
     {
         ESP_LOGW(TAG, "Failed to delete ACKed segment WAV: %s", segment->path);
+        storage_unlock();
+        return ESP_FAIL;
     }
-    if (remove(meta_path) != 0)
+    if (remove_path_if_present(meta_path) != ESP_OK ||
+        remove_path_if_present(tmp_path) != ESP_OK)
     {
-        ESP_LOGW(TAG, "Failed to delete ACKed segment metadata: %s", meta_path);
+        ESP_LOGW(TAG,
+                 "Failed to finish ACKed segment metadata cleanup segment_index=%" PRIu32,
+                 segment->segment_index);
+        storage_unlock();
+        return ESP_FAIL;
     }
+
+    upload_storage_path[0] = '\0';
+    storage_unlock();
+    return ESP_OK;
 }
 
 static esp_err_t find_next_pending_segment(upload_segment_t *segment)
@@ -876,13 +1393,14 @@ static esp_err_t find_next_pending_segment(upload_segment_t *segment)
 
     bool found = false;
     uint32_t found_index = UINT32_MAX;
-    upload_segment_t candidate = {0};
 
     struct dirent *entry = NULL;
     while ((entry = readdir(dir)) != NULL)
     {
         uint32_t segment_index = 0;
-        if (!parse_segment_meta_name(entry->d_name, &segment_index))
+        if (!parse_segment_wav_name(entry->d_name, &segment_index) &&
+            !parse_segment_meta_name(entry->d_name, &segment_index) &&
+            !parse_segment_tmp_meta_name(entry->d_name, &segment_index))
         {
             continue;
         }
@@ -891,26 +1409,19 @@ static esp_err_t find_next_pending_segment(upload_segment_t *segment)
             continue;
         }
 
-        upload_segment_t parsed = {0};
-        if (read_segment_metadata(segment_index, &parsed) != ESP_OK)
+        char candidate_path[SEGMENT_PATH_LEN];
+        segment_wav_path(candidate_path, sizeof(candidate_path), segment_index);
+        storage_lock();
+        bool is_active = active_storage_path[0] != '\0' &&
+                         strcmp(active_storage_path, candidate_path) == 0;
+        storage_unlock();
+        if (is_active)
         {
-            ESP_LOGW(TAG, "Ignoring unreadable segment metadata: %s", entry->d_name);
-            continue;
-        }
-
-        struct stat st;
-        if (stat(parsed.path, &st) != 0)
-        {
-            char meta_path[SEGMENT_PATH_LEN];
-            segment_meta_path_for_upload(&parsed, meta_path, sizeof(meta_path));
-            ESP_LOGW(TAG, "Deleting orphan segment metadata without WAV: %s", meta_path);
-            remove(meta_path);
             continue;
         }
 
         found = true;
         found_index = segment_index;
-        candidate = parsed;
     }
 
     closedir(dir);
@@ -919,7 +1430,9 @@ static esp_err_t find_next_pending_segment(upload_segment_t *segment)
         return ESP_ERR_NOT_FOUND;
     }
 
-    *segment = candidate;
+    memset(segment, 0, sizeof(*segment));
+    segment->segment_index = found_index;
+    segment_wav_path(segment->path, sizeof(segment->path), found_index);
     return ESP_OK;
 }
 
@@ -932,16 +1445,14 @@ static void upload_segment_until_acked(upload_segment_t *segment)
 
     while (1)
     {
-        struct stat st;
-        if (stat(segment->path, &st) != 0)
+        esp_err_t reserve_ret = reserve_segment_for_upload(segment);
+        if (reserve_ret != ESP_OK)
         {
-            char meta_path[SEGMENT_PATH_LEN];
-            segment_meta_path_for_upload(segment, meta_path, sizeof(meta_path));
             ESP_LOGW(TAG,
-                     "Pending segment WAV missing; dropping metadata path=%s segment_index=%" PRIu32,
-                     meta_path,
-                     segment->segment_index);
-            remove(meta_path);
+                     "Pending segment is no longer upload-eligible run_id=%s segment_index=%" PRIu32 " error=%s",
+                     segment->run_id,
+                     segment->segment_index,
+                     esp_err_to_name(reserve_ret));
             break;
         }
 
@@ -956,9 +1467,18 @@ static void upload_segment_until_acked(upload_segment_t *segment)
                      segment->run_id,
                      segment->segment_index,
                      segment->path);
-            delete_uploaded_segment(segment);
+            while (cleanup_acked_segment(segment) != ESP_OK)
+            {
+                ESP_LOGW(TAG,
+                         "ACKed segment cleanup will retry without another POST run_id=%s segment_index=%" PRIu32,
+                         segment->run_id,
+                         segment->segment_index);
+                vTaskDelay(pdMS_TO_TICKS(SEGMENT_UPLOAD_RETRY_DELAY_MS));
+            }
             break;
         }
+
+        release_upload_reservation(segment);
 
         segment_lock();
         recorder_stats.upload_retry_count++;
@@ -974,13 +1494,6 @@ static void upload_segment_until_acked(upload_segment_t *segment)
             segment->upload_retry_count++;
         }
         segment_unlock();
-        if (write_segment_metadata(segment) != ESP_OK)
-        {
-            ESP_LOGW(TAG,
-                     "Failed to update retry metadata run_id=%s segment_index=%" PRIu32,
-                     segment->run_id,
-                     segment->segment_index);
-        }
         ESP_LOGW(TAG,
                  "Segment upload failed; will retry run_id=%s segment_index=%" PRIu32 " error=%s",
                  segment->run_id,
@@ -1011,22 +1524,48 @@ static void upload_task(void *pvParameters)
 
 static esp_err_t ensure_upload_task(void)
 {
-    if (upload_task_started)
+    while (1)
     {
-        return ESP_OK;
-    }
+        bool start_task = false;
+        taskENTER_CRITICAL(&runtime_init_spinlock);
+        if (upload_task_started)
+        {
+            taskEXIT_CRITICAL(&runtime_init_spinlock);
+            return ESP_OK;
+        }
+        if (!upload_task_starting)
+        {
+            upload_task_starting = true;
+            start_task = true;
+        }
+        taskEXIT_CRITICAL(&runtime_init_spinlock);
 
-    if (xTaskCreate(upload_task,
-                    "seg_upload",
-                    SEGMENT_UPLOAD_TASK_STACK_SIZE,
-                    NULL,
-                    SEGMENT_UPLOAD_TASK_PRIORITY,
-                    &upload_task_handle) != pdPASS)
-    {
-        return ESP_ERR_NO_MEM;
+        if (!start_task)
+        {
+            vTaskDelay(1);
+            continue;
+        }
+
+        TaskHandle_t new_task_handle = NULL;
+        esp_err_t ret = xTaskCreate(upload_task,
+                                    "seg_upload",
+                                    SEGMENT_UPLOAD_TASK_STACK_SIZE,
+                                    NULL,
+                                    SEGMENT_UPLOAD_TASK_PRIORITY,
+                                    &new_task_handle) == pdPASS
+                            ? ESP_OK
+                            : ESP_ERR_NO_MEM;
+
+        taskENTER_CRITICAL(&runtime_init_spinlock);
+        if (ret == ESP_OK)
+        {
+            upload_task_handle = new_task_handle;
+            upload_task_started = true;
+        }
+        upload_task_starting = false;
+        taskEXIT_CRITICAL(&runtime_init_spinlock);
+        return ret;
     }
-    upload_task_started = true;
-    return ESP_OK;
 }
 
 esp_err_t audio_segment_recorder_start_pending_uploads(void)
@@ -1066,6 +1605,23 @@ esp_err_t audio_segment_recorder_start(void)
         return ret;
     }
 
+    segment_lock();
+    if (recorder_active)
+    {
+        ret = ESP_ERR_INVALID_STATE;
+    }
+    else
+    {
+        storage_lock();
+        ret = ensure_no_segment_artifacts_locked();
+        storage_unlock();
+    }
+    segment_unlock();
+    if (ret != ESP_OK)
+    {
+        return ret;
+    }
+
     if (!storage_can_accept(WAV_HEADER_SIZE + SEGMENT_UPLOAD_CHUNK_BYTES))
     {
         ESP_LOGE(TAG, "Not enough SPIFFS space to start segmented recording");
@@ -1082,20 +1638,29 @@ esp_err_t audio_segment_recorder_start(void)
     }
 
     segment_lock();
-    memset(&recorder_stats, 0, sizeof(recorder_stats));
-    make_run_id(recorder_stats.run_id, sizeof(recorder_stats.run_id));
-    recorder_active = true;
-    ret = open_active_segment(1);
-    if (ret != ESP_OK)
+    if (recorder_active)
     {
-        recorder_active = false;
+        ret = ESP_ERR_INVALID_STATE;
+    }
+    else
+    {
+        storage_lock();
+        ret = ensure_no_segment_artifacts_locked();
+        if (ret == ESP_OK)
+        {
+            memset(&recorder_stats, 0, sizeof(recorder_stats));
+            make_run_id(recorder_stats.run_id, sizeof(recorder_stats.run_id));
+            ret = open_active_segment_locked(1);
+            recorder_active = ret == ESP_OK;
+        }
+        storage_unlock();
     }
     segment_unlock();
 
     ESP_LOGI(TAG,
              "Segmented recording %s run_id=%s segment_seconds=%d",
              ret == ESP_OK ? "started" : "failed",
-             recorder_stats.run_id,
+             ret == ESP_OK ? recorder_stats.run_id : "none",
              CONFIG_AUDIO_SEGMENT_SECONDS);
     return ret;
 }
@@ -1184,12 +1749,15 @@ esp_err_t audio_segment_recorder_stop(void)
 void audio_segment_recorder_abort(void)
 {
     segment_lock();
+    storage_lock();
     if (active_segment.fp != NULL)
     {
         fclose(active_segment.fp);
         active_segment.fp = NULL;
         remove(active_segment.path);
     }
+    active_storage_path[0] = '\0';
+    storage_unlock();
     recorder_active = false;
     recorder_stats.local_gap_count++;
     segment_unlock();
